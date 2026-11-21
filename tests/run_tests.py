@@ -66,6 +66,7 @@ cfg, remote = tmp / "cfg", tmp / "remote.git"
 (cfg / "zigbee2mqtt" / "coordinator_backup.json").write_text('{"pan_id":"A1B2","extended_pan_id":"DEADBEEF","network_key":{"key":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16],"frame_counter":99},"channel":11}')
 (cfg / "esphome").mkdir()
 (cfg / "esphome" / "det.yaml").write_text("api:\n  encryption:\n    key: Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MDEyMzQ1Njc4OTA=\nwifi:\n  ssid: Maison\n  psk: wifipass123\n")
+(cfg / "go2rtc.yaml").write_text("streams:\n  CamArriere:\n    - tuya://protect-eu.example.me?device_id=abc123&email=bob%40example.com&password=SuperPwd99\n  Entree:\n    - rtsp://admin:camPass12@192.168.1.9:554/stream1\n")
 (cfg / "custom").mkdir()
 (cfg / "custom" / "extra.yaml").write_text("sensor:\n  - name: X\n    password: p4ss\n    value: 42\n")
 (cfg / "home-assistant_v2.db").write_text("DBDATA")
@@ -144,6 +145,9 @@ zb = json.loads((tot / "zigbee2mqtt/coordinator_backup.json").read_text())
 es = (tot / "esphome/det.yaml").read_text()
 ok(zb["network_key"] == "<masqué>" and zb["channel"] == 11 and "Zm9vYmFy" not in es and "key: <masqué>" in es and "wifipass123" not in es and "ssid: Maison" in es,
    "accès total : clé réseau Zigbee et clé de chiffrement ESPHome masquées, le reste lisible")
+g2 = (tot / "go2rtc.yaml").read_text()
+ok("SuperPwd99" not in allt and "camPass12" not in allt and "bob%40example" not in allt and "device_id=abc123" in g2 and "554/stream1" in g2,
+   "accès total : mot de passe / e-mail / identifiants dans une URL masqués, le reste de l'adresse lisible")
 ok(not (tot / ".storage/auth").exists() and not (tot / ".storage/cloud").exists() and "REFRESHTOKEN" not in allt and "CLOUDSECRET" not in allt, "accès total : jetons d'authentification jamais exportés")
 ok(not list(tot.rglob("*.db")) and "SUPERSECRET123" not in allt, "accès total : ni base de données ni valeurs de secrets.yaml")
 ok("50.1" in (sync.REPO / "exports/configuration.yaml").read_text() and "exports/total/custom/extra.yaml" in tracked and any(x.startswith("exports/total/.storage/") for x in tracked.splitlines()), "accès total : coordonnées lisibles, dossier .storage bien versionné")

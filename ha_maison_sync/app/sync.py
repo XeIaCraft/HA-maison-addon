@@ -191,7 +191,7 @@ MASK_KEYS = re.compile(r"(?im)^(\s*)(latitude|longitude|elevation|external_url|i
 def scan_text(text):
     hits = []
     for i, line in enumerate(text.splitlines(), 1):
-        if SENSITIVE_KEY.match(line) or SENSITIVE_VALUE.search(line) or LONG_KEY.match(line):
+        if SENSITIVE_KEY.match(line) or SENSITIVE_VALUE.search(line) or LONG_KEY.match(line) or URL_QUERY_SECRET.search(line) or URL_USERINFO.search(line):
             hits.append(i)
     return hits
 
@@ -490,6 +490,14 @@ REDACT_GEO = re.compile(_PREFIX % r"latitude|longitude")
 LONG_KEY = re.compile(r"(?im)^(\s*-?\s*key\s*:\s*)([\"']?)[A-Za-z0-9+/_\-=]{32,}\2\s*$")
 CRED_JSON_KEY = re.compile(r"(?i)(%s|credential|authorization)" % CRED_WORDS)
 MASKED = "<masqué>"
+# Secrets écrits DANS une adresse : ...?password=xxx&email=... ou rtsp://utilisateur:motdepasse@hôte
+URL_QUERY_SECRET = re.compile(r"(?i)([?&;](?:password|passwd|pwd|pass|token|api[_-]?key|apikey|secret|access_token|auth|signature|sign|email|mail|user|username|login)=)[^&\s\"'<>]+")
+URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://)([^/\s:@]+):([^@\s/]+)@")
+
+
+def mask_urls(text):
+    text = URL_QUERY_SECRET.sub(lambda m: m.group(1) + MASKED, text)
+    return URL_USERINFO.sub(lambda m: m.group(1) + MASKED + ":" + MASKED + "@", text)
 
 
 def redact_text(text, geo=True):
@@ -497,7 +505,7 @@ def redact_text(text, geo=True):
     text = LONG_KEY.sub(lambda m: m.group(1) + MASKED, text)
     if geo:
         text = REDACT_GEO.sub(lambda m: m.group(1) + MASKED, text)
-    return SENSITIVE_VALUE.sub(MASKED, text)
+    return mask_urls(SENSITIVE_VALUE.sub(MASKED, text))
 
 
 def redact_json(obj):
@@ -512,7 +520,7 @@ def redact_json(obj):
     if isinstance(obj, list):
         return [redact_json(v) for v in obj]
     if isinstance(obj, str):
-        return SENSITIVE_VALUE.sub(MASKED, obj)
+        return mask_urls(SENSITIVE_VALUE.sub(MASKED, obj))
     return obj
 
 
