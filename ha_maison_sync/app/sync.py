@@ -1,0 +1,917 @@
+"""Logique de synchronisation HA <-> GitHub (bibliothèque standard + PyYAML).
+
+Principes de sécurité :
+  - le jeton Supervisor et la clé SSH restent dans /data (jamais copiés vers le dépôt) ;
+  - ce qui monte vers GitHub est une liste blanche, sans secrets (analyse + masquage) ;
+  - ce qui descend vers HA est limité à `apply_paths`, jamais secrets.yaml / .storage / configuration.yaml,
+    jamais de lien symbolique, jamais de chemin qui sort de /config ;
+  - toute application est précédée d'une validation du dépôt et d'une sauvegarde, avec retour arrière.
+"""
+import difflib
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import tarfile
+import time
+import urllib.error
+import urllib.request
+
+import yaml
+
+DATA = pathlib.Path(os.environ.get("HA_MAISON_DATA", "/data"))
+OPTIONS_FILE = pathlib.Path(os.environ.get("HA_MAISON_OPTIONS", str(DATA / "options.json")))
+REPO = DATA / "repo"
+SSH_DIR = DATA / "ssh"
+KEY = SSH_DIR / "id_ed25519"
+SNAPS = DATA / "snapshots"
+STATE_FILE = DATA / "state.json"
+
+DEFAULTS = {
+    "repository": "",
+    "branch": "main",
+    "apply_paths": ["themes", "dashboards", "packages"],
+    "export_paths": ["themes", "dashboards", "packages", "automations.yaml", "scripts.yaml", "scenes.yaml", "blueprints"],
+    "export_full": True,
+    "restart_after_apply": False,
+    "git_user_name": "HA-maison Sync",
+    "git_user_email": "ha-maison-sync@localhost",
+}
+# Jamais appliqué vers HA, quoi qu'il y ait dans les options.
+FORBIDDEN_APPLY = {"secrets.yaml", "configuration.yaml", ".storage", "custom_components", ".git", ".ha-maison", "home-assistant_v2.db"}
+INVENTORY_EXCLUDE = {"person", "device_tracker", "zone", "persistent_notification"}
+MAX_FILE = 2 * 1024 * 1024
+SKIP_NAMES = {".git", "__pycache__", ".DS_Store"}
+
+
+class SyncError(Exception):
+    pass
+
+
+# ───────────────────────── options / état ─────────────────────────
+def options():
+    o = dict(DEFAULTS)
+    try:
+        o.update(json.loads(OPTIONS_FILE.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        pass
+    return o
+
+
+def safe_rel(p):
+    """Chemin relatif sûr (pas d'absolu, pas de '..'), sinon SyncError."""
+    pp = pathlib.PurePosixPath(p)
+    if pp.is_absolute() or ".." in pp.parts or not pp.parts:
+        raise SyncError(f"Chemin refusé : {p!r}")
+    return pp
+
+
+def apply_paths(o):
+    out = []
+    for p in o["apply_paths"]:
+        pp = safe_rel(p)
+        if pp.parts[0] in FORBIDDEN_APPLY or str(pp) in FORBIDDEN_APPLY:
+            raise SyncError(f"« {p} » ne peut pas être appliqué (protégé).")
+        out.append(str(pp))
+    return out
+
+
+def export_paths(o):
+    return [str(safe_rel(p)) for p in o["export_paths"]]
+
+
+def config_dir():
+    env = os.environ.get("HA_MAISON_CONFIG")
+    if env:
+        return pathlib.Path(env)
+    for c in ("/homeassistant", "/config"):
+        if pathlib.Path(c, "configuration.yaml").exists():
+            return pathlib.Path(c)
+    raise SyncError("Dossier de configuration HA introuvable (ni /homeassistant ni /config).")
+
+
+def load_state():
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_state(st):
+    DATA.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+# ───────────────────────── git ─────────────────────────
+def git(*args, cwd=None, check=True):
+    env = os.environ.copy()
+    env["GIT_SSH_COMMAND"] = (f"ssh -i {KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "
+                              f"-o UserKnownHostsFile={SSH_DIR / 'known_hosts'}")
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    p = subprocess.run(["git", *args], cwd=str(cwd or REPO), env=env, capture_output=True, text=True, timeout=180)
+    if check and p.returncode != 0:
+        raise SyncError(f"git {args[0]} a échoué : {(p.stderr or p.stdout).strip()[:500]}")
+    return (p.stdout or "").strip()
+
+
+def ensure_key():
+    SSH_DIR.mkdir(parents=True, exist_ok=True)
+    if not KEY.exists():
+        try:
+            subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-C", "ha-maison-sync", "-f", str(KEY)],
+                           check=True, capture_output=True)
+        except FileNotFoundError:      # absent seulement hors de l'add-on (tests locaux)
+            return None
+    os.chmod(KEY, 0o600)
+    return (KEY.with_suffix(".pub")).read_text(encoding="utf-8").strip()
+
+
+def ensure_repo(log):
+    o = options()
+    if not o["repository"]:
+        raise SyncError("Renseigne l'option « repository » de l'add-on (URL SSH du dépôt).")
+    ensure_key()
+    if not (REPO / ".git").exists():
+        DATA.mkdir(parents=True, exist_ok=True)
+        git("clone", o["repository"], str(REPO), cwd=DATA)
+        log("Dépôt cloné.")
+    git("remote", "set-url", "origin", o["repository"])
+    git("config", "user.name", o["git_user_name"])
+    git("config", "user.email", o["git_user_email"])
+    git("config", "core.autocrlf", "false")
+    return o
+
+
+def fetch_remote(o):
+    git("fetch", "origin", "--prune")
+    sha = git("rev-parse", "--verify", "-q", f"origin/{o['branch']}", check=False)
+    return sha or None
+
+
+def reset_to_remote(o, sha):
+    if sha:
+        git("checkout", "-q", "-B", o["branch"], f"origin/{o['branch']}")
+        git("reset", "-q", "--hard", f"origin/{o['branch']}")
+        git("clean", "-q", "-fd")
+    else:
+        # dépôt distant vide : on repart d'une branche vide
+        git("checkout", "-q", "--orphan", o["branch"], check=False)
+
+
+# ───────────────────────── fichiers ─────────────────────────
+def iter_files(base, paths):
+    """Fichiers réguliers (pas de liens symboliques) sous `paths`, chemins relatifs à `base`."""
+    base = pathlib.Path(base)
+    for p in paths:
+        root = base / p
+        if root.is_symlink() or not root.exists():
+            continue
+        cands = [root] if root.is_file() else sorted(root.rglob("*"))
+        for f in cands:
+            if f.is_symlink() or not f.is_file():
+                continue
+            if any(part in SKIP_NAMES for part in f.relative_to(base).parts):
+                continue
+            if f.stat().st_size > MAX_FILE:
+                continue
+            yield str(f.relative_to(base).as_posix())
+
+
+# ───────────────────────── secrets ─────────────────────────
+SENSITIVE_KEY = re.compile(
+    r"(?im)^\s*-?\s*[\w\-]*(password|passwd|token|api[_-]?key|apikey|secret|client_secret|access_token|bearer|private[_-]?key|webhook_id|latitude|longitude)\s*:\s*"
+    r"(?!\s*!secret)(?!\s*<masqué>)(?!\s*$)(?!\s*[\"']?(true|false|null|none)[\"']?\s*$)(?!\s*[|>])\S+")
+SENSITIVE_VALUE = re.compile(r"eyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{10,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}")
+MASK_KEYS = re.compile(r"(?im)^(\s*)(latitude|longitude|elevation|external_url|internal_url)\s*:.*$")
+
+
+def scan_text(text):
+    hits = []
+    for i, line in enumerate(text.splitlines(), 1):
+        if SENSITIVE_KEY.match(line) or SENSITIVE_VALUE.search(line):
+            hits.append(i)
+    return hits
+
+
+def scan_file(path):
+    try:
+        return scan_text(pathlib.Path(path).read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return []
+
+
+def sanitize_configuration(text):
+    return MASK_KEYS.sub(lambda m: f"{m.group(1)}{m.group(2)}: <masqué>", text)
+
+
+# ───────────────────────── API Supervisor / Core ─────────────────────────
+def _call(url, method="GET", body=None, timeout=60, raw=False):
+    tok = os.environ.get("SUPERVISOR_TOKEN")
+    if not tok:
+        return None
+    data = json.dumps(body if body is not None else {}).encode() if method != "GET" else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            txt = r.read().decode(errors="replace")
+            if raw:
+                return {"status": r.status, "text": txt}
+            return {"status": r.status, "json": json.loads(txt or "null")}
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode(errors="replace")
+        try:
+            return {"status": e.code, "json": json.loads(raw)}
+        except ValueError:
+            return {"status": e.code, "json": {"message": raw[:300]}}
+    except (urllib.error.URLError, OSError) as e:
+        return {"status": 0, "json": {"message": str(e)}}
+
+
+def core_check(log):
+    r = _call("http://supervisor/core/check", "POST", timeout=180)
+    if r is None:
+        log("⚠️ API Supervisor indisponible (mode test) : contrôle de config ignoré.")
+        return True
+    ok = r["status"] == 200 and (r["json"] or {}).get("result") == "ok"
+    log("✅ Contrôle de la configuration HA : OK." if ok else f"❌ Contrôle de la configuration HA : {(r['json'] or {}).get('message', r['status'])}")
+    return ok
+
+
+def core_service(domain, service, log):
+    r = _call(f"http://supervisor/core/api/services/{domain}/{service}", "POST", {})
+    if r is None:
+        log(f"⚠️ (mode test) {domain}.{service} non appelé.")
+        return
+    log(f"{'✅' if r['status'] == 200 else '⚠️'} {domain}.{service} → {r['status']}")
+
+
+def core_restart(log):
+    r = _call("http://supervisor/core/restart", "POST", timeout=30)
+    log("♻️ Redémarrage de HA demandé." if r and r["status"] == 200 else "⚠️ Redémarrage impossible (API indisponible).")
+
+
+def reload_for(changed, log):
+    top = {c.split("/")[0] for c in changed}
+    if "themes" in top:
+        core_service("frontend", "reload_themes", log)
+    if top & {"packages", "automations.yaml", "scripts.yaml", "scenes.yaml", "blueprints"}:
+        core_service("homeassistant", "reload_all", log)
+    if "dashboards" in top:
+        log("ℹ️ Dashboards : recharge la page du navigateur pour voir les changements.")
+
+
+def fetch_states():
+    r = _call("http://supervisor/core/api/states")
+    if r is None or r["status"] != 200:
+        return None
+    return r["json"]
+
+
+# ───────────────────────── opérations ─────────────────────────
+class Run:
+    def __init__(self):
+        self.lines = []
+
+    def __call__(self, msg):
+        self.lines.append(msg)
+
+
+def status(refresh=False):
+    st = load_state()
+    res = {"pubkey": None, "repository": options()["repository"], "branch": options()["branch"],
+           "last_applied": st.get("last_applied"), "last_export": st.get("last_export"),
+           "last_apply": st.get("last_apply"), "pending": [], "error": None, "snapshots": len(list(SNAPS.glob("*.tar.gz"))) if SNAPS.exists() else 0}
+    try:
+        res["pubkey"] = ensure_key()
+        if refresh and res["repository"]:
+            log = Run()
+            o = ensure_repo(log)
+            sha = fetch_remote(o)
+            res["remote"] = sha
+            if sha:
+                reset_to_remote(o, sha)
+                pl = make_plan(o, sha)
+                res["plan"] = {"add": len(pl["add"]), "modify": len(pl["modify"]), "delete": len(pl["delete"])}
+            last = st.get("last_applied")
+            if sha and sha != last:
+                rng = f"{last}..origin/{o['branch']}" if last else f"origin/{o['branch']}"
+                out = git("log", "--format=%h %s", "-n", "15", rng, check=False)
+                res["pending"] = out.splitlines()
+    except SyncError as e:
+        res["error"] = str(e)
+    except (OSError, subprocess.SubprocessError) as e:
+        res["error"] = f"{type(e).__name__}: {e}"
+    return res
+
+
+# ───────────────────────── export « complet » (tout sauf les identifiants) ─────────────────────────
+# Registres de HA : on ne garde que des champs utiles à l'analyse. Sont volontairement écartés :
+# unique_id / identifiers / connections (adresses MAC, numéros de série), configuration_url (IP),
+# et tout le contenu `data` / `options` des intégrations (là sont les mots de passe et jetons).
+REGISTRY_KEEP = {
+    "core.entity_registry": ("entities", ["entity_id", "platform", "name", "original_name", "device_id", "area_id", "disabled_by",
+                                          "hidden_by", "entity_category", "device_class", "original_device_class",
+                                          "unit_of_measurement", "icon", "original_icon"]),
+    "core.device_registry": ("devices", ["id", "name", "name_by_user", "manufacturer", "model", "sw_version", "area_id",
+                                         "via_device_id", "disabled_by", "entry_type"]),
+    "core.area_registry": ("areas", ["id", "name", "floor_id", "aliases", "icon", "labels"]),
+    "core.floor_registry": ("floors", ["floor_id", "name", "level", "aliases", "icon"]),
+    "core.label_registry": ("labels", ["label_id", "name", "icon", "color", "description"]),
+    "core.config_entries": ("entries", ["domain", "title", "source", "disabled_by", "version"]),
+}
+HELPER_STORES = ["input_boolean", "input_select", "input_number", "input_text", "input_datetime", "input_button",
+                 "counter", "timer", "schedule"]
+LOG_LEVEL = re.compile(r"^\d{4}-\d\d-\d\d[ T][\d:.]+\s+(\w+)")
+REDACT = [
+    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "<ip>"),
+    (re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b"), "<mac>"),
+    (re.compile(r"[\w.+\-]+@[\w\-]+\.[\w.\-]+"), "<email>"),
+    (re.compile(r"(?i)\b(token|password|passwd|api[_-]?key|apikey|secret|authorization|bearer)([=:\s\"']+)\S+"), r"\1\2<masqué>"),
+    (re.compile(r"\?[^\s\"')]+"), "?<masqué>"),
+    (re.compile(r"[A-Za-z0-9_\-]{32,}"), "<masqué>"),
+]
+
+
+def _load_json(path):
+    try:
+        return json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def sanitize_registries(storage, out):
+    n = 0
+    out.mkdir(parents=True, exist_ok=True)
+    for fname, (key, fields) in REGISTRY_KEEP.items():
+        d = _load_json(storage / fname)
+        items = ((d or {}).get("data") or {}).get(key)
+        if not isinstance(items, list):
+            continue
+        rows = [{k: it.get(k) for k in fields if it.get(k) not in (None, [], "")} for it in items if isinstance(it, dict)]
+        rows.sort(key=lambda r: json.dumps(r, sort_keys=True))
+        (out / f"{fname}.json").write_text(json.dumps(rows, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+        n += 1
+    return n
+
+
+def export_helpers(storage, out, skipped):
+    n = 0
+    out.mkdir(parents=True, exist_ok=True)
+    for name in HELPER_STORES:
+        f = storage / name
+        if not f.is_file() or f.is_symlink():
+            continue
+        if scan_file(f):
+            skipped.append(f".storage/{name}")
+            continue
+        items = ((_load_json(f) or {}).get("data") or {}).get("items")
+        if items:
+            (out / f"{name}.json").write_text(json.dumps(items, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+            n += 1
+    return n
+
+
+def export_hacs(cfg, out):
+    """Cartes / intégrations installées (HACS + custom_components) : noms et versions seulement."""
+    out.mkdir(parents=True, exist_ok=True)
+    info = {"hacs": [], "custom_components": [], "www_community": []}
+    d = _load_json(cfg / ".storage" / "hacs.repositories")
+    for r in ((d or {}).get("data") or {}).values():
+        if isinstance(r, dict) and r.get("installed"):
+            info["hacs"].append({"repository": r.get("full_name"), "category": r.get("category"),
+                                 "version": r.get("installed_version") or r.get("version_installed")})
+    info["hacs"].sort(key=lambda r: str(r["repository"]))
+    cc = cfg / "custom_components"
+    if cc.is_dir():
+        for m in sorted(cc.glob("*/manifest.json")):
+            md = _load_json(m) or {}
+            info["custom_components"].append({"domain": md.get("domain") or m.parent.name, "name": md.get("name"), "version": md.get("version")})
+    wc = cfg / "www" / "community"
+    if wc.is_dir():
+        info["www_community"] = sorted(x.name for x in wc.iterdir() if x.is_dir())
+    (out / "installed_extensions.json").write_text(json.dumps(info, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+
+
+def secret_names(cfg):
+    """Seulement les NOMS des secrets (jamais leurs valeurs) : permet de savoir quels !secret existent."""
+    f = cfg / "secrets.yaml"
+    if not f.is_file() or f.is_symlink():
+        return None
+    return sorted(set(re.findall(r"(?m)^([A-Za-z0-9_.\-]+)\s*:", f.read_text(encoding="utf-8", errors="replace"))))
+
+
+def redact(line):
+    for rx, rep in REDACT:
+        line = rx.sub(rep, line)
+    return line
+
+
+def collect_errors(cfg, max_lines=400):
+    f = cfg / "home-assistant.log"
+    text = None
+    if f.is_file() and not f.is_symlink():
+        try:
+            with open(f, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, fh.tell() - 2_000_000))
+                text = fh.read().decode("utf-8", errors="replace")
+        except OSError:
+            text = None
+    if text is None:
+        r = _call("http://supervisor/core/logs", raw=True)
+        if r and r["status"] == 200:
+            text = r.get("text", "")
+    if not text:
+        return None
+    keep, on = [], False
+    for line in text.splitlines()[-3000:]:
+        m = LOG_LEVEL.match(line)
+        if m:
+            on = m.group(1) in ("ERROR", "WARNING", "CRITICAL")
+        if on:
+            line = redact(line)
+            if not scan_text(line):
+                keep.append(line)
+    return "\n".join(keep[-max_lines:]) + "\n" if keep else ""
+
+
+def export_system(out):
+    info = {}
+    r = _call("http://supervisor/core/info")
+    if r and r["status"] == 200:
+        d = (r["json"] or {}).get("data") or {}
+        info["core"] = {"version": d.get("version"), "machine": d.get("machine"), "arch": d.get("arch")}
+    r = _call("http://supervisor/addons")
+    if r and r["status"] == 200:
+        info["addons"] = [{"name": a.get("name"), "slug": a.get("slug"), "version": a.get("version"), "state": a.get("state")}
+                          for a in ((r["json"] or {}).get("data") or {}).get("addons", [])]
+    if info:
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "system.json").write_text(json.dumps(info, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    return bool(info)
+
+
+def export_full(cfg, ex, log, skipped):
+    """Tout ce qui aide à comprendre et optimiser HA — sans identifiants. Régénéré à chaque envoi."""
+    for sub in ("registry", "helpers", "logs"):
+        shutil.rmtree(ex / sub, ignore_errors=True)
+    storage = cfg / ".storage"
+    parts = []
+    if storage.is_dir():
+        a = sanitize_registries(storage, ex / "registry")
+        b = export_helpers(storage, ex / "helpers", skipped)
+        parts.append(f"{a} registre(s), {b} type(s) de helpers")
+    export_hacs(cfg, ex)
+    names = secret_names(cfg)
+    if names is not None:
+        (ex / "secrets_keys.txt").write_text("# Noms des secrets (valeurs jamais envoyées)\n" + "\n".join(names) + "\n", encoding="utf-8")
+        parts.append(f"{len(names)} nom(s) de secrets")
+    errs = collect_errors(cfg)
+    if errs is not None:
+        (ex / "logs").mkdir(exist_ok=True)
+        (ex / "logs" / "errors.log").write_text(errs, encoding="utf-8")
+        parts.append(f"journal d'erreurs ({len(errs.splitlines())} lignes, masqué)")
+    if export_system(ex):
+        parts.append("version de HA + add-ons")
+    log("📦 Export complet : " + (", ".join(parts) if parts else "rien de plus à envoyer") + ".")
+
+
+def export(force=False):
+    log = Run()
+    o = ensure_repo(log)
+    cfg = config_dir()
+    st = load_state()
+    sha = fetch_remote(o)
+    if sha and st.get("last_applied") and sha != st["last_applied"] and not force:
+        raise SyncError("Des modifications sur GitHub n'ont pas encore été appliquées à HA. Applique-les d'abord "
+                        "(ou force l'envoi : cela écraserait les fichiers du dépôt par ceux de HA).")
+    reset_to_remote(o, sha)
+
+    # 1) fichiers gérés (jamais de suppression côté dépôt)
+    skipped, copied = [], 0
+    for rel in iter_files(cfg, export_paths(o)):
+        src = cfg / rel
+        if scan_file(src):
+            skipped.append(rel)
+            continue
+        dst = REPO / rel
+        if dst.exists() and dst.read_bytes() == src.read_bytes():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+        copied += 1
+    log(f"{copied} fichier(s) géré(s) mis à jour dans le dépôt.")
+
+    # 2) exports en lecture seule (jamais appliqués à HA)
+    ex = REPO / "exports"
+    ex.mkdir(exist_ok=True)
+    conf = cfg / "configuration.yaml"
+    if conf.exists():
+        text = sanitize_configuration(conf.read_text(encoding="utf-8", errors="replace"))
+        if scan_text(text):
+            skipped.append("configuration.yaml")
+        else:
+            (ex / "configuration.yaml").write_text(text, encoding="utf-8")
+    storage = cfg / ".storage"
+    if storage.is_dir():
+        (ex / "lovelace").mkdir(exist_ok=True)
+        for f in sorted(storage.glob("lovelace*")):
+            if f.is_file() and not f.is_symlink() and f.stat().st_size <= MAX_FILE:
+                if scan_file(f):
+                    skipped.append(f".storage/{f.name}")
+                else:
+                    shutil.copyfile(f, ex / "lovelace" / f.name)
+    states = fetch_states()
+    if states is not None:
+        inv = []
+        for s in states:
+            dom = s["entity_id"].split(".")[0]
+            if dom in INVENTORY_EXCLUDE:
+                continue
+            a = s.get("attributes", {})
+            inv.append({"entity_id": s["entity_id"], "name": a.get("friendly_name"), "domain": dom,
+                        "unit": a.get("unit_of_measurement"), "device_class": a.get("device_class"),
+                        "unavailable": s.get("state") in ("unavailable", "unknown")})
+        inv.sort(key=lambda e: e["entity_id"])
+        (REPO / "inventory").mkdir(exist_ok=True)
+        (REPO / "inventory" / "entities.json").write_text(json.dumps(inv, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+        log(f"Inventaire : {len(inv)} entités (sans valeurs).")
+    else:
+        log("⚠️ Inventaire des entités non mis à jour (API Core indisponible).")
+    if o.get("export_full", True):
+        export_full(cfg, ex, log, skipped)
+    if skipped:
+        log("🔒 Non envoyés (valeurs sensibles détectées — remplace-les par !secret) : " + ", ".join(sorted(set(skipped))))
+
+    # 3) commit + push
+    git("add", "-A")
+    if not git("status", "--porcelain"):
+        log("Rien à envoyer : GitHub est déjà à jour.")
+        head = git("rev-parse", "HEAD", check=False) or None
+    else:
+        git("commit", "-q", "-m", f"Export depuis Home Assistant ({time.strftime('%Y-%m-%d %H:%M')})")
+        git("push", "-u", "origin", f"HEAD:{o['branch']}")
+        head = git("rev-parse", "HEAD")
+        log(f"✅ Envoyé vers GitHub ({head[:7]}).")
+    st["last_applied"] = head
+    st["last_export"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    save_state(st)
+    return {"log": log.lines, "skipped": sorted(set(skipped))}
+
+
+def make_plan(o, sha):
+    cfg = config_dir()
+    paths = apply_paths(o)
+    add, mod, same = [], [], 0
+    for rel in iter_files(REPO, paths):
+        dst = cfg / rel
+        if not dst.exists():
+            add.append(rel)
+        elif dst.read_bytes() != (REPO / rel).read_bytes():
+            mod.append(rel)
+        else:
+            same += 1
+    delete = []
+    last = load_state().get("last_applied")
+    if last and sha and last != sha:
+        out = git("diff", "--name-only", "--diff-filter=D", last, sha, "--", *paths, check=False)
+        delete = [f for f in out.splitlines() if (cfg / f).is_file() and not (cfg / f).is_symlink()]
+    diffs = {}
+    for rel in mod:
+        try:
+            a = (cfg / rel).read_text(encoding="utf-8", errors="replace").splitlines()
+            b = (REPO / rel).read_text(encoding="utf-8", errors="replace").splitlines()
+            d = list(difflib.unified_diff(a, b, f"HA/{rel}", f"GitHub/{rel}", lineterm="", n=2))
+            diffs[rel] = "\n".join(d[:400])
+        except OSError:
+            pass
+    return {"add": add, "modify": mod, "delete": delete, "same": same, "diffs": diffs}
+
+
+def preview():
+    log = Run()
+    o = ensure_repo(log)
+    sha = fetch_remote(o)
+    if not sha:
+        raise SyncError("Le dépôt GitHub est vide : rien à appliquer.")
+    reset_to_remote(o, sha)
+    plan = make_plan(o, sha)
+    plan["log"] = log.lines
+    plan["commit"] = sha[:7]
+    return plan
+
+
+def validate_repo(log):
+    script = pathlib.Path(__file__).resolve().parent / "validate.py"   # copie embarquée, pas celle du dépôt
+    p = subprocess.run(["python3", str(script), str(REPO)], capture_output=True, text=True, timeout=120)
+    out = (p.stdout + p.stderr).strip()
+    log(("✅ Validation du dépôt : OK." if p.returncode == 0 else "❌ Validation du dépôt :\n" + out))
+    return p.returncode == 0
+
+
+def snapshot(cfg, plan, sha, previous):
+    SNAPS.mkdir(parents=True, exist_ok=True)
+    name = time.strftime("%Y%m%d-%H%M%S") + "-%03d" % (int(time.time() * 1000) % 1000)
+    manifest = {"time": name, "sha": sha, "previous_applied": previous,
+                "added": plan["add"], "modified": plan["modify"], "deleted": plan["delete"]}
+    with tarfile.open(SNAPS / f"{name}.tar.gz", "w:gz") as t:
+        for rel in plan["modify"] + plan["delete"]:
+            t.add(cfg / rel, arcname=f"files/{rel}")
+        mp = SNAPS / f"{name}.json"
+        mp.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+        t.add(mp, arcname="manifest.json")
+        mp.unlink()
+    for old in sorted(SNAPS.glob("*.tar.gz"))[:-10]:
+        old.unlink()
+    return name
+
+
+def apply():
+    log = Run()
+    o = ensure_repo(log)
+    cfg = config_dir()
+    sha = fetch_remote(o)
+    if not sha:
+        raise SyncError("Le dépôt GitHub est vide : rien à appliquer.")
+    reset_to_remote(o, sha)
+    plan = make_plan(o, sha)
+    if not (plan["add"] or plan["modify"] or plan["delete"]):
+        log("Rien à appliquer : HA est déjà identique au dépôt.")
+        st = load_state()
+        st["last_applied"] = sha
+        save_state(st)
+        return {"log": log.lines, "changed": []}
+    if not validate_repo(log):
+        raise SyncError("Application annulée : la validation du dépôt a échoué (rien n'a été modifié dans HA).")
+    st = load_state()
+    snap = snapshot(cfg, plan, sha, st.get("last_applied"))
+    log(f"💾 Sauvegarde des fichiers concernés : {snap}")
+    changed = []
+    try:
+        for rel in plan["add"] + plan["modify"]:
+            dst = cfg / rel
+            if dst.is_symlink():
+                raise SyncError(f"Lien symbolique refusé : {rel}")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(REPO / rel, dst)
+            changed.append(rel)
+        for rel in plan["delete"]:
+            (cfg / rel).unlink()
+            changed.append(rel)
+        log(f"📥 {len(plan['add'])} ajouté(s), {len(plan['modify'])} modifié(s), {len(plan['delete'])} supprimé(s).")
+        if not core_check(log):
+            raise SyncError("La configuration HA est invalide avec ces fichiers.")
+    except Exception as e:  # retour arrière automatique
+        log(f"↩️ Retour arrière automatique : {e}")
+        _restore(snap, cfg, log)
+        raise SyncError(f"Application annulée et fichiers restaurés. Détail : {e}") from e
+    reload_for(changed, log)
+    if o["restart_after_apply"]:
+        core_restart(log)
+    st["last_applied"] = sha
+    st["last_apply"] = time.strftime("%Y-%m-%d %H:%M:%S") + f" ({sha[:7]})"
+    st["last_snapshot"] = snap
+    save_state(st)
+    log("✅ Terminé.")
+    return {"log": log.lines, "changed": changed}
+
+
+def _restore(name, cfg, log):
+    tpath = SNAPS / f"{name}.tar.gz"
+    with tarfile.open(tpath) as t:
+        manifest = json.loads(t.extractfile("manifest.json").read().decode())
+        for rel in manifest["added"]:
+            f = cfg / safe_rel(rel)
+            if f.is_file() and not f.is_symlink():
+                f.unlink()
+                parent = f.parent
+                while parent != cfg and parent.is_dir() and not any(parent.iterdir()):
+                    parent.rmdir()
+                    parent = parent.parent
+        for rel in manifest["modified"] + manifest["deleted"]:
+            member = t.getmember(f"files/{rel}")
+            data = t.extractfile(member).read()
+            dst = cfg / safe_rel(rel)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(data)
+    return manifest
+
+
+def rollback():
+    log = Run()
+    cfg = config_dir()
+    snaps = sorted(SNAPS.glob("*.tar.gz")) if SNAPS.exists() else []
+    if not snaps:
+        raise SyncError("Aucune sauvegarde disponible.")
+    name = snaps[-1].name[:-7]
+    manifest = _restore(name, cfg, log)
+    snaps[-1].unlink()
+    log(f"↩️ Restauration de {name} ({len(manifest['added'])} fichier(s) retiré(s), "
+        f"{len(manifest['modified']) + len(manifest['deleted'])} restauré(s)).")
+    reload_for(manifest["added"] + manifest["modified"] + manifest["deleted"], log)
+    st = load_state()
+    st["last_applied"] = manifest.get("previous_applied")
+    st["last_apply"] = None
+    save_state(st)
+    return {"log": log.lines}
+
+
+# ───────────────────────── branchement dans configuration.yaml ─────────────────────────
+# On n'AJOUTE que les lignes manquantes (jamais de suppression, jamais de réécriture), on vérifie que le YAML obtenu
+# contient bien ce qu'on veut, on sauvegarde, puis HA contrôle la config ; en cas d'échec : retour arrière.
+WIRE_DASHBOARDS = {
+    "maison-tablette": {"mode": "yaml", "title": "Maison", "icon": "mdi:home-variant", "show_in_sidebar": "true",
+                        "filename": "dashboards/maison-tablette.yaml"},
+    "maison-mobile": {"mode": "yaml", "title": "Maison mobile", "icon": "mdi:cellphone", "show_in_sidebar": "true",
+                      "filename": "dashboards/maison-mobile.yaml"},
+}
+TOP_KEY = re.compile(r"^([A-Za-z0-9_]+):(.*)$")
+
+
+class _CfgLoader(yaml.SafeLoader):
+    pass
+
+
+for _t in ("!secret", "!include", "!include_dir_named", "!include_dir_merge_named", "!include_dir_list",
+           "!include_dir_merge_list", "!env_var", "!input"):
+    _CfgLoader.add_constructor(_t, lambda l, n: l.construct_scalar(n))
+
+
+def _blocks(lines):
+    """{clé de 1er niveau: (index ligne clé, index de fin exclu, valeur en ligne)}."""
+    out, keys = {}, []
+    for i, ln in enumerate(lines):
+        m = TOP_KEY.match(ln)
+        if m and not ln.startswith("#"):
+            keys.append((m.group(1), i, m.group(2).split("#")[0].strip()))
+    for n, (k, i, v) in enumerate(keys):
+        end = keys[n + 1][1] if n + 1 < len(keys) else len(lines)
+        out[k] = (i, end, v)
+    return out
+
+
+def _child_indent(lines, i, end):
+    for ln in lines[i + 1:end]:
+        if ln.strip() and not ln.lstrip().startswith("#"):
+            return len(ln) - len(ln.lstrip())
+    return 2
+
+
+def _children(lines, i, end, ind):
+    res = {}
+    for j in range(i + 1, end):
+        ln = lines[j]
+        if ln.strip() and not ln.lstrip().startswith("#") and len(ln) - len(ln.lstrip()) == ind:
+            m = re.match(r"\s*([\w\-]+):(.*)$", ln)
+            if m:
+                res[m.group(1)] = (j, m.group(2).split("#")[0].strip())
+    return res
+
+
+def _dash_lines(name, d, ind):
+    pad = " " * ind
+    return [f"{pad}{name}:"] + [f"{pad}  {k}: {v}" for k, v in d.items()]
+
+
+def plan_wiring(text):
+    """Retourne (nouveau_texte, ajouts[list[str]], manuel[list[str]])."""
+    nl = "\r\n" if "\r\n" in text else "\n"
+    lines = text.replace("\r\n", "\n").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    added, manual = [], []
+
+    def need_block(key, body_lines, label):
+        nonlocal lines
+        b = _blocks(lines)
+        if key not in b:
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.append(f"{key}:")
+            lines.extend(body_lines)
+            added.append(label)
+            return None
+        return b[key]
+
+    # homeassistant.packages
+    hit = need_block("homeassistant", ["  packages: !include_dir_named packages"], "homeassistant → packages")
+    if hit:
+        i, end, inline = hit
+        if inline:
+            manual.append("homeassistant: est défini en une ligne / par include : ajoute `packages: !include_dir_named packages`.")
+        else:
+            ind = _child_indent(lines, i, end)
+            ch = _children(lines, i, end, ind)
+            if "packages" in ch:
+                v = ch["packages"][1]
+                if not ("!include_dir" in v and "packages" in v):
+                    manual.append("homeassistant.packages existe déjà et n'inclut pas le dossier `packages` : à fusionner à la main.")
+            else:
+                lines.insert(i + 1, " " * ind + "packages: !include_dir_named packages")
+                added.append("homeassistant → packages")
+    # frontend.themes
+    hit = need_block("frontend", ["  themes: !include_dir_merge_named themes"], "frontend → themes")
+    if hit:
+        i, end, inline = hit
+        if inline:
+            manual.append("frontend: est défini par un include : vérifie qu'il charge `themes: !include_dir_merge_named themes`.")
+        else:
+            ind = _child_indent(lines, i, end)
+            ch = _children(lines, i, end, ind)
+            if "themes" in ch:
+                v = ch["themes"][1]
+                if not ("!include_dir" in v and "themes" in v):
+                    manual.append("frontend.themes existe déjà et n'inclut pas le dossier `themes` : à fusionner à la main.")
+            else:
+                lines.insert(i + 1, " " * ind + "themes: !include_dir_merge_named themes")
+                added.append("frontend → themes")
+    # lovelace.dashboards
+    body = ["  dashboards:"]
+    for n, d in WIRE_DASHBOARDS.items():
+        body += _dash_lines(n, d, 4)
+    hit = need_block("lovelace", body, "lovelace → dashboards Maison")
+    if hit:
+        i, end, inline = hit
+        if inline:
+            manual.append("lovelace: est défini par un include : ajoute-y les dashboards maison-tablette / maison-mobile.")
+        else:
+            ind = _child_indent(lines, i, end)
+            ch = _children(lines, i, end, ind)
+            if "dashboards" not in ch:
+                new = [" " * ind + "dashboards:"]
+                for n, d in WIRE_DASHBOARDS.items():
+                    new += _dash_lines(n, d, ind + 2)
+                lines[i + 1:i + 1] = new
+                added.append("lovelace → dashboards Maison")
+            else:
+                j, inline_d = ch["dashboards"]
+                if inline_d:
+                    manual.append("lovelace.dashboards est défini en une ligne / par include : à compléter à la main.")
+                else:
+                    end2 = end
+                    sub_ind = _child_indent(lines, j, end2)
+                    have = _children(lines, j, end2, sub_ind)
+                    new = []
+                    for n, d in WIRE_DASHBOARDS.items():
+                        if n not in have:
+                            new += _dash_lines(n, d, sub_ind)
+                            added.append(f"lovelace.dashboards → {n}")
+                    lines[j + 1:j + 1] = new
+    out = nl.join(lines) + nl
+    # garde-fou : le YAML obtenu doit être valide et contenir ce qu'on a promis
+    if added:
+        try:
+            d = yaml.load(out, Loader=_CfgLoader) or {}
+            ok = ("packages" in (d.get("homeassistant") or {}) and "themes" in (d.get("frontend") or {})
+                  and all(n in ((d.get("lovelace") or {}).get("dashboards") or {}) for n in WIRE_DASHBOARDS))
+        except yaml.YAMLError:
+            ok = False
+        if not ok:
+            return text, [], manual + ["Le fichier obtenu n'a pas pu être validé : aucune modification automatique (fais-le à la main)."]
+    return (out if added else text), added, manual
+
+
+def wire_preview():
+    cfg = config_dir()
+    f = cfg / "configuration.yaml"
+    if not f.is_file() or f.is_symlink():
+        raise SyncError("configuration.yaml introuvable.")
+    old = f.read_text(encoding="utf-8")
+    new, added, manual = plan_wiring(old)
+    diff = "\n".join(difflib.unified_diff(old.splitlines(), new.splitlines(), "configuration.yaml (actuel)",
+                                          "configuration.yaml (après)", lineterm="", n=2))
+    return {"added": added, "manual": manual, "diff": diff, "log": []}
+
+
+def wire_apply():
+    log = Run()
+    cfg = config_dir()
+    f = cfg / "configuration.yaml"
+    if not f.is_file() or f.is_symlink():
+        raise SyncError("configuration.yaml introuvable.")
+    old = f.read_text(encoding="utf-8")
+    new, added, manual = plan_wiring(old)
+    for m in manual:
+        log("✋ À faire à la main : " + m)
+    if not added:
+        log("Rien à ajouter : tout est déjà branché." if not manual else "Aucune modification automatique possible.")
+        return {"log": log.lines, "changed": []}
+    plan = {"add": [], "modify": ["configuration.yaml"], "delete": []}
+    snap = snapshot(cfg, plan, None, load_state().get("last_applied"))
+    log(f"💾 Sauvegarde de configuration.yaml : {snap}")
+    f.write_text(new, encoding="utf-8")
+    log("📝 Ajouté : " + ", ".join(added))
+    if not core_check(log):
+        _restore(snap, cfg, log)
+        raise SyncError("La configuration HA est invalide avec ces lignes : configuration.yaml a été restauré.")
+    log("✅ Terminé. Redémarre Home Assistant pour que le thème, les helpers et les dashboards apparaissent.")
+    return {"log": log.lines, "changed": ["configuration.yaml"]}
+
+
+def restart():
+    log = Run()
+    core_restart(log)
+    return {"log": log.lines}

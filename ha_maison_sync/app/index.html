@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HA-maison</title>
+<style>
+  :root{--bg:#eef2fb;--card:#fff;--fg:#1d2433;--mut:#667086;--bd:#e3e8f4;--acc:#3b66e8;--ok:#2e9e4f;--ko:#d9453f;--warn:#c77a00;--soft:#f1f3f9}
+  @media (prefers-color-scheme:dark){:root{--bg:#12141c;--card:#1b1e28;--fg:#e8eaf0;--mut:#98a2b6;--bd:#2a2f3e;--acc:#6ea8ff;--soft:#242836}}
+  *{box-sizing:border-box}body{margin:0;font:15px/1.45 system-ui,Roboto,sans-serif;background:var(--bg);color:var(--fg);padding:16px}
+  .wrap{max-width:900px;margin:0 auto;display:grid;gap:14px}
+  h1{margin:0 0 2px;font-size:22px}h2{margin:0 0 10px;font-size:13px;letter-spacing:.8px;text-transform:uppercase;color:var(--mut)}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:18px;padding:16px}
+  .row{display:flex;gap:10px;flex-wrap:wrap}
+  button{font:inherit;font-weight:600;border:0;border-radius:999px;padding:11px 18px;cursor:pointer;background:var(--acc);color:#fff}
+  button.sec{background:var(--soft);color:var(--fg)}button.danger{background:var(--ko)}button:disabled{opacity:.5;cursor:wait}
+  code,pre{background:var(--soft);border-radius:10px;font:12.5px ui-monospace,Menlo,monospace}
+  code{padding:2px 6px}pre{padding:12px;overflow:auto;max-height:340px;white-space:pre-wrap;word-break:break-word;margin:8px 0 0}
+  .key{word-break:break-all;display:block;padding:10px;margin-top:6px;user-select:all}
+  .mut{color:var(--mut)}.ok{color:var(--ok)}.ko{color:var(--ko)}.warn{color:var(--warn)}
+  .pill{display:inline-block;padding:3px 10px;border-radius:99px;background:var(--soft);font-size:13px;margin:2px 4px 2px 0}
+  details{margin-top:8px}summary{cursor:pointer;font-weight:600}
+  ol{margin:6px 0 0 18px;padding:0}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div><h1>🏠 HA-maison</h1><div class="mut">Synchronise ta configuration avec GitHub, applique les modifications de Claude, annule si besoin.</div></div>
+
+  <div class="card" id="state"><h2>État</h2><div id="stateBody" class="mut">Chargement…</div></div>
+
+  <div class="card" id="setup" hidden>
+    <h2>Première configuration</h2>
+    <ol>
+      <li>Copie cette clé publique : <code class="key" id="pubkey"></code></li>
+      <li>GitHub → dépôt <b>HA-maison</b> → Settings → <b>Deploy keys</b> → Add deploy key → colle la clé et coche <b>Allow write access</b>.</li>
+      <li>Reviens ici et clique sur « Actualiser ».</li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <h2>Actions</h2>
+    <div class="row">
+      <button id="bExport" class="sec">⬆️ Envoyer ma config vers GitHub</button>
+      <button id="bPreview" class="sec">👀 Voir les modifications à appliquer</button>
+      <button id="bApply">✅ Appliquer à mon HA</button>
+      <button id="bWire" class="sec">🔌 Brancher dans configuration.yaml</button>
+      <button id="bRollback" class="sec">↩️ Annuler la dernière application</button>
+      <button id="bRestart" class="sec">♻️ Redémarrer HA</button>
+      <button id="bRefresh" class="sec">🔄 Actualiser</button>
+    </div>
+    <div class="mut" style="margin-top:10px">« Envoyer » met à jour GitHub avec ta config actuelle (sans secrets) pour que Claude puisse la lire.
+      « Appliquer » copie les fichiers validés du dépôt dans HA, après sauvegarde, contrôle de la configuration et rechargement. « Brancher » ajoute (une seule fois) les quelques lignes de configuration.yaml qui activent le thème, les helpers et les dashboards.</div>
+  </div>
+
+  <div class="card"><h2>Journal</h2><div id="out" class="mut">Aucune action pour l'instant.</div></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const buttons = ['bExport','bPreview','bApply','bWire','bRollback','bRestart','bRefresh'];
+function busy(b){ buttons.forEach(id => $('#'+id).disabled = b); }
+
+async function api(path, body){
+  const opt = body === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)};
+  const r = await fetch(path, opt);                      // chemins relatifs : requis par Ingress
+  return r.json();
+}
+function showLog(lines, extra){
+  $('#out').className = '';
+  $('#out').innerHTML = '<pre>' + esc((lines||[]).join('\n')) + '</pre>' + (extra||'');
+}
+function showError(e){ $('#out').className='ko'; $('#out').innerHTML = '❌ ' + esc(e); }
+
+async function refresh(){
+  const s = await api('api/status?refresh=1');
+  if(!s.ok){ $('#stateBody').innerHTML = '<span class="warn">'+esc(s.error)+'</span>'; return; }
+  const p = s.plan, n = p ? p.add + p.modify + p.delete : 0;
+  let h = '';
+  h += '<div><b>Dépôt</b> : <code>'+esc(s.repository||'(non configuré)')+'</code> · branche <code>'+esc(s.branch)+'</code></div>';
+  if(s.error) h += '<div class="ko">⚠️ '+esc(s.error)+'</div>';
+  h += '<div style="margin-top:8px">';
+  if(p) h += n ? '<span class="pill warn">'+n+' fichier(s) en attente d\'application (+'+p.add+' ~'+p.modify+' −'+p.delete+')</span>' : '<span class="pill ok">HA est à jour avec le dépôt</span>';
+  h += '<span class="pill">Dernier envoi : '+esc(s.last_export||'—')+'</span><span class="pill">Dernière application : '+esc(s.last_apply||'—')+'</span><span class="pill">Sauvegardes : '+s.snapshots+'</span></div>';
+  if(s.pending && s.pending.length) h += '<details><summary>Derniers commits en attente</summary><pre>'+esc(s.pending.join('\n'))+'</pre></details>';
+  $('#stateBody').className=''; $('#stateBody').innerHTML = h;
+  $('#setup').hidden = !!(s.last_export || s.last_apply);
+  $('#pubkey').textContent = s.pubkey || '';
+}
+
+async function run(path, body, confirmMsg){
+  if(confirmMsg && !confirm(confirmMsg)) return;
+  busy(true); $('#out').className='mut'; $('#out').textContent='En cours…';
+  try{
+    const r = await api(path, body);
+    if(!r.ok) showError(r.error); else render(path, r);
+  }catch(e){ showError(e.message); }
+  busy(false); refresh();
+}
+function render(path, r){
+  if(path.endsWith('wire_preview')){
+    const ad = (r.added||[]).map(a=>'<li>'+esc(a)+'</li>').join('');
+    const mn = (r.manual||[]).map(a=>'<li class="warn">'+esc(a)+'</li>').join('');
+    $('#out').className=''; $('#out').innerHTML =
+      (ad ? '<div><b>Lignes qui seraient ajoutées :</b><ul>'+ad+'</ul></div>' : '<div class="ok">Rien à ajouter : tout est déjà branché.</div>') +
+      (mn ? '<div><b>À faire à la main :</b><ul>'+mn+'</ul></div>' : '') +
+      (r.diff ? '<details open><summary>Différences</summary><pre>'+esc(r.diff)+'</pre></details>' : '');
+    return;
+  }
+  if(path.endsWith('preview')){
+    const parts = [];
+    const L = (t, a) => a.length ? '<div><b>'+t+'</b><ul>'+a.map(f=>'<li><code>'+esc(f)+'</code></li>').join('')+'</ul></div>' : '';
+    parts.push(L('➕ Ajoutés', r.add), L('✏️ Modifiés', r.modify), L('🗑️ Supprimés', r.delete));
+    if(!r.add.length && !r.modify.length && !r.delete.length) parts.push('<div class="ok">Rien à appliquer : HA est identique au dépôt (commit '+esc(r.commit)+').</div>');
+    Object.entries(r.diffs||{}).forEach(([f,d]) => parts.push('<details><summary>Voir les différences : '+esc(f)+'</summary><pre>'+esc(d)+'</pre></details>'));
+    $('#out').className=''; $('#out').innerHTML = parts.join('');
+  } else {
+    showLog(r.log, (r.skipped && r.skipped.length) ? '<div class="warn" style="margin-top:8px">🔒 Non envoyés (valeurs sensibles) : '+esc(r.skipped.join(', '))+'</div>' : '');
+  }
+}
+
+$('#bExport').onclick   = () => run('api/export', {force:false});
+$('#bPreview').onclick  = () => run('api/preview', {});
+$('#bApply').onclick    = () => run('api/apply', {}, 'Appliquer les modifications du dépôt à ton Home Assistant ?\n(Sauvegarde automatique + contrôle de config + retour arrière si erreur.)');
+$('#bWire').onclick = async () => {
+  busy(true); $('#out').className='mut'; $('#out').textContent='Analyse de configuration.yaml…';
+  try{
+    const r = await api('api/wire_preview', {});
+    if(!r.ok){ showError(r.error); busy(false); return; }
+    render('api/wire_preview', r);
+    if(!(r.added||[]).length){ busy(false); return; }
+    busy(false);
+    if(!confirm('Ajouter ces lignes à configuration.yaml ?\n(Sauvegarde + contrôle de HA + retour arrière automatique si erreur. Tu devras ensuite redémarrer HA.)')) return;
+    await run('api/wire', {});
+  }catch(e){ showError(e.message); busy(false); }
+};
+$('#bRollback').onclick = () => run('api/rollback', {}, 'Restaurer l\'état d\'avant la dernière application ?');
+$('#bRestart').onclick  = () => run('api/restart', {}, 'Redémarrer Home Assistant maintenant ?');
+$('#bRefresh').onclick  = refresh;
+refresh();
+</script>
+</body>
+</html>
