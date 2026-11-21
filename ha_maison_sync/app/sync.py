@@ -182,7 +182,7 @@ def iter_files(base, paths):
 
 # ───────────────────────── secrets ─────────────────────────
 SENSITIVE_KEY = re.compile(
-    r"(?im)^\s*-?\s*[\w\-]*(password|passwd|token|api[_-]?key|apikey|secret|client_secret|access_token|bearer|private[_-]?key|webhook_id|latitude|longitude)\s*:\s*"
+    r"(?im)^\s*-?\s*[\w\-]*(password|passwd|token|api[_-]?key|apikey|secret|client_secret|access_token|bearer|private[_-]?key|webhook_id|psk|network[_-]?key|encryption[_-]?key|master[_-]?key|latitude|longitude)\s*:\s*"
     r"(?!\s*!secret)(?!\s*<masqué>)(?!\s*$)(?!\s*[\"']?(true|false|null|none)[\"']?\s*$)(?!\s*[|>])\S+")
 SENSITIVE_VALUE = re.compile(r"eyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{10,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}")
 MASK_KEYS = re.compile(r"(?im)^(\s*)(latitude|longitude|elevation|external_url|internal_url)\s*:.*$")
@@ -191,7 +191,7 @@ MASK_KEYS = re.compile(r"(?im)^(\s*)(latitude|longitude|elevation|external_url|i
 def scan_text(text):
     hits = []
     for i, line in enumerate(text.splitlines(), 1):
-        if SENSITIVE_KEY.match(line) or SENSITIVE_VALUE.search(line):
+        if SENSITIVE_KEY.match(line) or SENSITIVE_VALUE.search(line) or LONG_KEY.match(line):
             hits.append(i)
     return hits
 
@@ -482,16 +482,19 @@ def export_full(cfg, ex, log, skipped):
 
 # ───────────────────────── masquage des valeurs sensibles (au lieu d'écarter le fichier entier) ─────────────────────────
 # On voit TOUT le fichier ; seules les VALEURS des mots de passe / jetons / clés sont remplacées par <masqué>.
-CRED_WORDS = r"password|passwd|token|api[_-]?key|apikey|secret|client_secret|access_token|bearer|private[_-]?key|webhook_id|psk"
+CRED_WORDS = r"password|passwd|token|api[_-]?key|apikey|secret|client_secret|access_token|bearer|private[_-]?key|webhook_id|psk|network[_-]?key|encryption[_-]?key|master[_-]?key"
 _PREFIX = r"(?im)^(\s*-?\s*[\w\-]*(?:%s)\s*:\s*)(?!!secret)(?!<masqué>)(?![|>])(?!\s*$)(?![\"']?(?:true|false|null|none)[\"']?\s*$)\S.*$"
 REDACT_CRED = re.compile(_PREFIX % CRED_WORDS)
 REDACT_GEO = re.compile(_PREFIX % r"latitude|longitude")
+# `key:` seul (ex. ESPHome « encryption: key: … ») : masqué quand la valeur ressemble à une clé (32+ caractères base64/hex)
+LONG_KEY = re.compile(r"(?im)^(\s*-?\s*key\s*:\s*)([\"']?)[A-Za-z0-9+/_\-=]{32,}\2\s*$")
 CRED_JSON_KEY = re.compile(r"(?i)(%s|credential|authorization)" % CRED_WORDS)
 MASKED = "<masqué>"
 
 
 def redact_text(text, geo=True):
     text = REDACT_CRED.sub(lambda m: m.group(1) + MASKED, text)
+    text = LONG_KEY.sub(lambda m: m.group(1) + MASKED, text)
     if geo:
         text = REDACT_GEO.sub(lambda m: m.group(1) + MASKED, text)
     return SENSITIVE_VALUE.sub(MASKED, text)
@@ -499,8 +502,13 @@ def redact_text(text, geo=True):
 
 def redact_json(obj):
     if isinstance(obj, dict):
-        return {k: (MASKED if CRED_JSON_KEY.search(str(k)) and isinstance(v, (str, int, float)) and v not in ("", None)
-                    else redact_json(v)) for k, v in obj.items()}
+        def secret_value(k, v):
+            if isinstance(v, bool) or v in ("", None, [], {}):
+                return False
+            if CRED_JSON_KEY.search(str(k)):          # valeur simple OU bloc entier (ex. network_key: {key: [...]})
+                return True
+            return str(k) == "key" and isinstance(v, str) and len(v) >= 32 and re.fullmatch(r"[A-Za-z0-9+/_\-=]+", v) is not None
+        return {k: (MASKED if secret_value(k, v) else redact_json(v)) for k, v in obj.items()}
     if isinstance(obj, list):
         return [redact_json(v) for v in obj]
     if isinstance(obj, str):
