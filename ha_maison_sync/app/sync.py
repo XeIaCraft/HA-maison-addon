@@ -35,6 +35,7 @@ DEFAULTS = {
     "apply_paths": ["themes", "dashboards", "packages"],
     "export_paths": ["themes", "dashboards", "packages", "automations.yaml", "scripts.yaml", "scenes.yaml", "blueprints"],
     "export_full": True,
+    "full_access": False,
     "restart_after_apply": False,
     "git_user_name": "HA-maison Sync",
     "git_user_email": "ha-maison-sync@localhost",
@@ -479,6 +480,98 @@ def export_full(cfg, ex, log, skipped):
     log("📦 Export complet : " + (", ".join(parts) if parts else "rien de plus à envoyer") + ".")
 
 
+# ───────────────────────── masquage des valeurs sensibles (au lieu d'écarter le fichier entier) ─────────────────────────
+# On voit TOUT le fichier ; seules les VALEURS des mots de passe / jetons / clés sont remplacées par <masqué>.
+CRED_WORDS = r"password|passwd|token|api[_-]?key|apikey|secret|client_secret|access_token|bearer|private[_-]?key|webhook_id|psk"
+_PREFIX = r"(?im)^(\s*-?\s*[\w\-]*(?:%s)\s*:\s*)(?!!secret)(?!<masqué>)(?![|>])(?!\s*$)(?![\"']?(?:true|false|null|none)[\"']?\s*$)\S.*$"
+REDACT_CRED = re.compile(_PREFIX % CRED_WORDS)
+REDACT_GEO = re.compile(_PREFIX % r"latitude|longitude")
+CRED_JSON_KEY = re.compile(r"(?i)(%s|credential|authorization)" % CRED_WORDS)
+MASKED = "<masqué>"
+
+
+def redact_text(text, geo=True):
+    text = REDACT_CRED.sub(lambda m: m.group(1) + MASKED, text)
+    if geo:
+        text = REDACT_GEO.sub(lambda m: m.group(1) + MASKED, text)
+    return SENSITIVE_VALUE.sub(MASKED, text)
+
+
+def redact_json(obj):
+    if isinstance(obj, dict):
+        return {k: (MASKED if CRED_JSON_KEY.search(str(k)) and isinstance(v, (str, int, float)) and v not in ("", None)
+                    else redact_json(v)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [redact_json(v) for v in obj]
+    if isinstance(obj, str):
+        return SENSITIVE_VALUE.sub(MASKED, obj)
+    return obj
+
+
+def redacted_bytes(path, geo=True):
+    """Contenu masqué d'un fichier texte ou JSON (None si illisible)."""
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    try:
+        data = json.loads(text)
+        return (json.dumps(redact_json(data), ensure_ascii=False, indent=1) + "\n").encode()
+    except ValueError:
+        return redact_text(text, geo=geo).encode()
+
+
+# ───────────────────────── mode « accès total » (option full_access) ─────────────────────────
+# Tout le dossier de config en lecture : fichiers texte / JSON de toute l'arborescence + tout .storage, avec
+# VALEURS de mots de passe / jetons masquées. Jamais exportés, même en mode total : les fichiers d'authentification
+# (jetons d'accès à HA et au cloud), les valeurs de secrets.yaml, les bases de données, les sauvegardes.
+TOTAL_SKIP_DIRS = {".storage", ".cloud", "deps", "tts", "backup", "backups", ".git", "__pycache__", "node_modules",
+                   ".venv", "custom_components", "image", "media", "recordings"}
+TOTAL_SKIP_PREFIX = ("www/community",)
+TOTAL_SUFFIX = {".yaml", ".yml", ".json", ".py", ".jinja", ".jinja2", ".txt", ".md", ".conf", ".cfg", ".ini", ".toml", ".sh", ".csv"}
+STORAGE_DENY = re.compile(r"^(auth|auth_provider\..*|cloud|onboarding|mobile_app|core\.restore_state|core\.uuid|http\.auth)(\..*)?$")
+TOTAL_FILE_MAX, STORAGE_FILE_MAX, TOTAL_MAX_FILES, TOTAL_MAX_BYTES = 512 * 1024, 3 * 1024 * 1024, 3000, 30 * 1024 * 1024
+
+
+def export_total(cfg, ex, log):
+    out = ex / "total"
+    shutil.rmtree(out, ignore_errors=True)
+    n, size, masked = 0, 0, 0
+
+    def put(rel, src, geo=False):
+        nonlocal n, size, masked
+        if n >= TOTAL_MAX_FILES or size >= TOTAL_MAX_BYTES:
+            return
+        data = redacted_bytes(src, geo=geo)
+        if data is None:
+            return
+        if MASKED.encode() in data:
+            masked += 1
+        dst = out / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(data)
+        n += 1
+        size += len(data)
+
+    for root, dirs, files in os.walk(cfg, followlinks=False):
+        rel_root = pathlib.PurePosixPath(pathlib.Path(root).relative_to(cfg).as_posix())
+        dirs[:] = sorted(d for d in dirs if d not in TOTAL_SKIP_DIRS and not d.startswith(".")
+                         and not str(rel_root / d).startswith(TOTAL_SKIP_PREFIX))
+        for f in sorted(files):
+            p = pathlib.Path(root) / f
+            if p.is_symlink() or f == "secrets.yaml" or f.endswith((".log", ".db", ".db-shm", ".db-wal")):
+                continue
+            if p.suffix.lower() in TOTAL_SUFFIX and p.stat().st_size <= TOTAL_FILE_MAX:
+                put(str(rel_root / f) if str(rel_root) != "." else f, p)
+    storage = cfg / ".storage"
+    if storage.is_dir():
+        for f in sorted(storage.iterdir()):
+            if f.is_file() and not f.is_symlink() and not STORAGE_DENY.match(f.name) and f.stat().st_size <= STORAGE_FILE_MAX:
+                put(f".storage/{f.name}", f)
+    log(f"🔓 Accès total : {n} fichier(s) dans exports/total/ ({size // 1024} Ko), {masked} avec des valeurs sensibles masquées.")
+    return n
+
+
 def export(force=False):
     log = Run()
     o = ensure_repo(log)
@@ -491,10 +584,18 @@ def export(force=False):
     reset_to_remote(o, sha)
 
     # 1) fichiers gérés (jamais de suppression côté dépôt)
+    shutil.rmtree(REPO / "exports" / "redacted", ignore_errors=True)
     skipped, copied = [], 0
+    full_access = bool(o.get("full_access"))
     for rel in iter_files(cfg, export_paths(o)):
         src = cfg / rel
         if scan_file(src):
+            # valeurs sensibles : copie masquée en lecture seule (jamais au chemin géré, pour ne rien réappliquer par erreur)
+            data = redacted_bytes(src, geo=not full_access)
+            if data is not None:
+                red = REPO / "exports" / "redacted" / rel
+                red.parent.mkdir(parents=True, exist_ok=True)
+                red.write_bytes(data)
             skipped.append(rel)
             continue
         dst = REPO / rel
@@ -510,17 +611,24 @@ def export(force=False):
     ex.mkdir(exist_ok=True)
     conf = cfg / "configuration.yaml"
     if conf.exists():
-        text = sanitize_configuration(conf.read_text(encoding="utf-8", errors="replace"))
-        if scan_text(text):
-            skipped.append("configuration.yaml")
-        else:
-            (ex / "configuration.yaml").write_text(text, encoding="utf-8")
+        text = conf.read_text(encoding="utf-8", errors="replace")
+        if not full_access:
+            text = sanitize_configuration(text)            # coordonnées / URL masquées
+        if scan_text(text) or full_access:
+            red = redact_text(text, geo=not full_access)   # valeurs sensibles masquées, le reste est lisible
+            if red != text:
+                skipped.append("configuration.yaml")
+            text = red
+        (ex / "configuration.yaml").write_text(text, encoding="utf-8")
     storage = cfg / ".storage"
     if storage.is_dir():
         (ex / "lovelace").mkdir(exist_ok=True)
         for f in sorted(storage.glob("lovelace*")):
             if f.is_file() and not f.is_symlink() and f.stat().st_size <= MAX_FILE:
                 if scan_file(f):
+                    data = redacted_bytes(f)
+                    if data is not None:
+                        (ex / "lovelace" / f.name).write_bytes(data)
                     skipped.append(f".storage/{f.name}")
                 else:
                     shutil.copyfile(f, ex / "lovelace" / f.name)
@@ -541,13 +649,19 @@ def export(force=False):
         log(f"Inventaire : {len(inv)} entités (sans valeurs).")
     else:
         log("⚠️ Inventaire des entités non mis à jour (API Core indisponible).")
-    if o.get("export_full", True):
+    if o.get("export_full", True) or full_access:
         export_full(cfg, ex, log, skipped)
+    if full_access:
+        export_total(cfg, ex, log)
+    else:
+        shutil.rmtree(ex / "total", ignore_errors=True)
     if skipped:
-        log("🔒 Non envoyés (valeurs sensibles détectées — remplace-les par !secret) : " + ", ".join(sorted(set(skipped))))
+        log("🔒 Valeurs sensibles masquées (le reste du fichier est envoyé ; copie dans exports/) : " + ", ".join(sorted(set(skipped))))
 
     # 3) commit + push
     git("add", "-A")
+    if full_access and (ex / "total").is_dir():
+        git("add", "-f", "-A", "exports/total")      # .gitignore ignore .storage/ etc. : on force pour ce dossier voulu
     if not git("status", "--porcelain"):
         log("Rien à envoyer : GitHub est déjà à jour.")
         head = git("rev-parse", "HEAD", check=False) or None
@@ -559,7 +673,7 @@ def export(force=False):
     st["last_applied"] = head
     st["last_export"] = time.strftime("%Y-%m-%d %H:%M:%S")
     save_state(st)
-    return {"log": log.lines, "skipped": sorted(set(skipped))}
+    return {"log": log.lines, "skipped": sorted(set(skipped)), "redacted": sorted(set(skipped))}
 
 
 def make_plan(o, sha):
@@ -644,6 +758,10 @@ def apply():
         st["last_applied"] = sha
         save_state(st)
         return {"log": log.lines, "changed": []}
+    for rel in plan["add"] + plan["modify"]:
+        if MASKED.encode() in (REPO / rel).read_bytes():
+            raise SyncError(f"Application annulée : « {rel} » contient des valeurs masquées ({MASKED}). Remets les vraies valeurs "
+                            "(ou une référence !secret) avant de l'appliquer. Rien n'a été modifié dans HA.")
     if not validate_repo(log):
         raise SyncError("Application annulée : la validation du dépôt a échoué (rien n'a été modifié dans HA).")
     st = load_state()

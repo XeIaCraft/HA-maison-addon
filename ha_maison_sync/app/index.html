@@ -116,7 +116,7 @@ function render(path, r){
     Object.entries(r.diffs||{}).forEach(([f,d]) => parts.push('<details><summary>Voir les différences : '+esc(f)+'</summary><pre>'+esc(d)+'</pre></details>'));
     $('#out').className=''; $('#out').innerHTML = parts.join('');
   } else {
-    showLog(r.log, (r.skipped && r.skipped.length) ? '<div class="warn" style="margin-top:8px">🔒 Non envoyés (valeurs sensibles) : '+esc(r.skipped.join(', '))+'</div>' : '');
+    showLog(r.log, (r.skipped && r.skipped.length) ? '<div class="warn" style="margin-top:8px">🔒 Valeurs sensibles masquées (le reste est envoyé) : '+esc((r.redacted||r.skipped).join(', '))+'</div>' : '');
   }
 }
 

@@ -1,5 +1,5 @@
 name: HA-maison Sync
-version: "0.3.1"
+version: "0.4.0"
 slug: ha_maison_sync
 description: Envoie ta config Home Assistant vers GitHub (pour que Claude la consulte) et applique ses modifications en un clic, avec sauvegarde et retour arrière.
 url: https://github.com/XeIaCraft/HA-maison-addon
@@ -35,6 +35,7 @@ options:
     - scenes.yaml
     - blueprints
   export_full: true
+  full_access: false
   restart_after_apply: false
   git_user_name: HA-maison Sync
   git_user_email: ha-maison-sync@localhost
@@ -46,6 +47,7 @@ schema:
   export_paths:
     - str
   export_full: bool
+  full_access: bool
   restart_after_apply: bool
   git_user_name: str
   git_user_email: str

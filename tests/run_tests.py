@@ -54,12 +54,17 @@ ok("\n" not in sync.plan_wiring("default_config:\r\n")[0].replace("\r\n", ""), "
 
 # ───────── 2) envoi / application / retour arrière / sécurité ─────────
 cfg, remote = tmp / "cfg", tmp / "remote.git"
-(cfg / "configuration.yaml").write_text("homeassistant:\n  latitude: 50.1\n  longitude: 4.6\n  external_url: https://x.example\n")
+(cfg / "configuration.yaml").write_text("homeassistant:\n  latitude: 50.1\n  longitude: 4.6\n  external_url: https://x.example\nmqtt:\n  broker: 10.0.0.5\n  password: hunter2\n  username: bob\n")
 (cfg / "secrets.yaml").write_text("api_key: SUPERSECRET123\n")
 (cfg / "automations.yaml").write_text("- alias: test\n  trigger: []\n  action: []\n")
 (cfg / "scripts.yaml").write_text("s:\n  sequence:\n    - data:\n        api_key: sk-abcdefghijklmnopqrstuvwxyz123456\n")
 (cfg / ".storage" / "lovelace.x").write_text('{"data":{"config":{"views":[]}}}')
-(cfg / ".storage" / "core.config_entries").write_text('{"data":{"entries":[{"domain":"x","title":"X","data":{"api_key":"TOPSECRETKEY"}}]}}')
+(cfg / ".storage" / "core.config_entries").write_text('{"data":{"entries":[{"domain":"template","title":"Hum abs","data":{"api_key":"TOPSECRETKEY"},"options":{"state":"{{ states(\'sensor.a\') }}","token":{"access_token":"ATOK123456789"}}}]}}')
+(cfg / ".storage" / "auth").write_text('{"data":{"refresh_tokens":[{"token":"REFRESHTOKEN-ADMIN"}]}}')
+(cfg / ".storage" / "cloud").write_text('{"data":{"cloudhook":"CLOUDSECRET"}}')
+(cfg / "custom").mkdir()
+(cfg / "custom" / "extra.yaml").write_text("sensor:\n  - name: X\n    password: p4ss\n    value: 42\n")
+(cfg / "home-assistant_v2.db").write_text("DBDATA")
 seed = tmp / "seed"
 for f, t in {"themes/maison/maison.yaml": "Maison:\n  ha-card-border-radius: 24px\n  modes:\n    light: {primary-color: '#fff'}\n    dark: {primary-color: '#000'}\n",
              "dashboards/d.yaml": "views:\n  - title: A\n    path: a\n    cards: []\n",
@@ -75,7 +80,13 @@ sh("git", "clone", "-q", "--bare", str(seed), str(remote))
 r = sync.export()
 alltext = "\n".join(f.read_text(errors="ignore") for f in sync.REPO.rglob("*") if f.is_file() and ".git" not in f.parts)
 ok("SUPERSECRET123" not in alltext and "TOPSECRETKEY" not in alltext and "50.1" not in alltext, "export : aucun secret ni coordonnée")
-ok("scripts.yaml" in r["skipped"], "export : fichier avec clé en clair refusé")
+ok("scripts.yaml" in r["skipped"], "export : fichier avec clé en clair signalé")
+red = (sync.REPO / "exports/redacted/scripts.yaml")
+ok(red.exists() and "api_key: <masqué>" in red.read_text() and "sequence:" in red.read_text() and not (sync.REPO / "scripts.yaml").exists(),
+   "export : copie masquée lisible dans exports/redacted (jamais au chemin géré)")
+cf = (sync.REPO / "exports/configuration.yaml").read_text()
+ok("hunter2" not in alltext and "password: <masqué>" in cf and "broker: 10.0.0.5" in cf and "mqtt:" in cf, "configuration.yaml envoyé (valeurs sensibles masquées, reste lisible)")
+ok(not (sync.REPO / "exports/total").exists(), "mode standard : pas de dossier exports/total")
 ok((sync.REPO / "automations.yaml").exists() and (sync.REPO / "exports/lovelace/lovelace.x").exists(), "export : automations + dashboards interface")
 a = sync.apply()
 ok((cfg / "themes/maison/maison.yaml").exists() and (cfg / "packages/p.yaml").exists(), "application : fichiers copiés")
@@ -103,6 +114,35 @@ for bad in (["../etc"], ["secrets.yaml"], ["/etc/passwd"], [".storage"]):
         sync.apply(); ok(False, f"{bad} accepté")
     except sync.SyncError:
         ok(True, f"chemin {bad} refusé")
+# un fichier contenant des valeurs masquées ne doit jamais être réappliqué
+(w / "dashboards/d.yaml").write_text(before)
+(w / "packages/p.yaml").write_text("input_select:\n  tab_x:\n    options: [A, B]\n    password: <masqué>\n")
+g("commit", "-qam", "masqué"); g("push", "-q", "origin", "main")
+(tmp / "options.json").write_text(json.dumps({"repository": f"file://{remote}"}))
+before_p = (cfg / "packages/p.yaml").read_text()
+try:
+    sync.apply(); ok(False, "fichier masqué appliqué !")
+except sync.SyncError as e:
+    ok("masquées" in str(e) and (cfg / "packages/p.yaml").read_text() == before_p, "fichier avec <masqué> refusé à l'application")
+(w / "packages/p.yaml").write_text(before_p); g("commit", "-qam", "ok"); g("push", "-q", "origin", "main")
+
+# mode accès total
+(tmp / "options.json").write_text(json.dumps({"repository": f"file://{remote}", "full_access": True}))
+r = sync.export(force=True)
+tot = sync.REPO / "exports/total"
+tracked = subprocess.run(["git", "-C", str(sync.REPO), "ls-tree", "-r", "HEAD", "--name-only"], capture_output=True, text=True).stdout
+allt = "\n".join(f.read_text(errors="ignore") for f in sync.REPO.rglob("*") if f.is_file() and ".git" not in f.parts)
+ok((tot / "custom/extra.yaml").exists() and "value: 42" in (tot / "custom/extra.yaml").read_text(), "accès total : fichiers de toute l'arborescence")
+ok("p4ss" not in allt and "TOPSECRETKEY" not in allt and "ATOK123456789" not in allt and "hunter2" not in allt, "accès total : valeurs de mots de passe / jetons masquées")
+ce = (tot / ".storage/core.config_entries").read_text()
+ok("sensor.a" in ce and "template" in ce, "accès total : configuration des intégrations lisible (modèles, options)")
+ok(not (tot / ".storage/auth").exists() and not (tot / ".storage/cloud").exists() and "REFRESHTOKEN" not in allt and "CLOUDSECRET" not in allt, "accès total : jetons d'authentification jamais exportés")
+ok(not list(tot.rglob("*.db")) and "SUPERSECRET123" not in allt, "accès total : ni base de données ni valeurs de secrets.yaml")
+ok("50.1" in (sync.REPO / "exports/configuration.yaml").read_text() and "exports/total/custom/extra.yaml" in tracked and any(x.startswith("exports/total/.storage/") for x in tracked.splitlines()), "accès total : coordonnées lisibles, dossier .storage bien versionné")
+(tmp / "options.json").write_text(json.dumps({"repository": f"file://{remote}"}))
+sync.export(force=True)
+ok(not (sync.REPO / "exports/total").exists(), "retour au mode standard : exports/total supprimé")
+
 # branchement de bout en bout + restauration si HA refuse
 (tmp / "options.json").write_text(json.dumps({"repository": f"file://{remote}"}))
 orig = (cfg / "configuration.yaml").read_text()

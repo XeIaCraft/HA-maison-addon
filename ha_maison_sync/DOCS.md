@@ -17,4 +17,5 @@
 | `apply_paths` | Fichiers/dossiers applicables à HA (jamais `secrets.yaml`, `configuration.yaml`, `.storage`) |
 | `export_paths` | Fichiers/dossiers envoyés vers GitHub |
 | `export_full` | Envoyer aussi registres, helpers, journal d'erreurs masqué, add-ons/extensions installés, noms des secrets (jamais d'identifiants) |
+| `full_access` | **Accès total** (désactivé par défaut) : envoie en lecture seule, dans `exports/total/`, tous les fichiers texte/JSON de ta config et tout `.storage`, coordonnées comprises. Les VALEURS de mots de passe / jetons sont masquées (`<masqué>`). Jamais envoyés : jetons d'authentification de HA et du cloud (`.storage/auth*`, `cloud`, `onboarding`, `mobile_app`), valeurs de `secrets.yaml`, bases de données |
 | `restart_after_apply` | Redémarrer HA après chaque application |
