@@ -21,6 +21,8 @@ ACTIONS = {
     "/api/wire_preview": lambda body: sync.wire_preview(),
     "/api/wire": lambda body: sync.wire_apply(),
     "/api/restart": lambda body: sync.restart(),
+    "/api/clean_preview": lambda body: sync.clean_preview(),
+    "/api/clean_apply": lambda body: sync.clean_apply(body),
 }
 
 

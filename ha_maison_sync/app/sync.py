@@ -11,12 +11,16 @@ import difflib
 import json
 import os
 import pathlib
+import base64
 import re
 import shutil
+import socket
+import struct
 import subprocess
 import tarfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import yaml
@@ -1043,6 +1047,226 @@ def wire_apply():
         raise SyncError("La configuration HA est invalide avec ces lignes : configuration.yaml a été restauré.")
     log("✅ Terminé. Redémarre Home Assistant pour que le thème, les helpers et les dashboards apparaissent.")
     return {"log": log.lines, "changed": ["configuration.yaml"]}
+
+
+
+# ───────────────────────── nettoyage : entités orphelines, ressources inutiles ─────────────────────────
+# Parler au registre d'entités et aux ressources des dashboards demande le WebSocket de HA (pas d'API REST pour ça).
+# Client WebSocket minimal (bibliothèque standard) : pas de dépendance à installer.
+class HAWebSocket:
+    def __init__(self, url=None, token=None, timeout=30):
+        self.url = url or os.environ.get("HA_MAISON_WS_URL", "ws://supervisor/core/websocket")
+        self.token = token or os.environ.get("HA_MAISON_WS_TOKEN") or os.environ.get("SUPERVISOR_TOKEN")
+        if not self.token:
+            raise SyncError("Jeton Supervisor absent : impossible de parler à Home Assistant (mode test ?).")
+        u = urllib.parse.urlparse(self.url)
+        host, port, path = u.hostname, u.port or 80, (u.path or "/") + (("?" + u.query) if u.query else "")
+        try:
+            self.sock = socket.create_connection((host, port), timeout=timeout)
+        except OSError as e:
+            raise SyncError(f"WebSocket de HA injoignable ({e}).") from e
+        self.buf = b""
+        self.next_id = 0
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                           f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        head = self._read_until(b"\r\n\r\n")
+        if b" 101 " not in head.split(b"\r\n", 1)[0]:
+            raise SyncError("Le WebSocket de HA a refusé la connexion.")
+        hello = self._recv_json()
+        if hello.get("type") != "auth_required":
+            raise SyncError("Réponse inattendue du WebSocket de HA.")
+        self._send_json({"type": "auth", "access_token": self.token})
+        if self._recv_json().get("type") != "auth_ok":
+            raise SyncError("HA a refusé l'authentification WebSocket.")
+
+    def _read_until(self, marker):
+        while marker not in self.buf:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise SyncError("Connexion WebSocket fermée.")
+            self.buf += chunk
+        i = self.buf.index(marker) + len(marker)
+        out, self.buf = self.buf[:i], self.buf[i:]
+        return out
+
+    def _read_n(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise SyncError("Connexion WebSocket fermée.")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def _send_frame(self, opcode, payload):
+        mask = os.urandom(4)
+        n = len(payload)
+        head = bytes([0x80 | opcode])
+        head += bytes([0x80 | n]) if n < 126 else (bytes([0x80 | 126]) + struct.pack(">H", n) if n < 65536 else bytes([0x80 | 127]) + struct.pack(">Q", n))
+        self.sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def _send_json(self, obj):
+        self._send_frame(1, json.dumps(obj).encode())
+
+    def _recv_json(self):
+        msg = b""
+        while True:
+            b0, b1 = self._read_n(2)
+            op, fin, n = b0 & 0x0F, b0 & 0x80, b1 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._read_n(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._read_n(8))[0]
+            payload = self._read_n(n)          # les trames du serveur ne sont pas masquées
+            if op == 8:
+                raise SyncError("Connexion WebSocket fermée par HA.")
+            if op == 9:
+                self._send_frame(10, payload)
+                continue
+            if op in (1, 0):
+                msg += payload
+                if fin:
+                    return json.loads(msg.decode())
+
+    def call(self, **msg):
+        self.next_id += 1
+        msg["id"] = self.next_id
+        self._send_json(msg)
+        while True:
+            r = self._recv_json()
+            if r.get("id") == self.next_id and r.get("type") == "result":
+                if not r.get("success"):
+                    raise SyncError(f"HA a refusé « {msg.get('type')} » : {(r.get('error') or {}).get('message', 'erreur')}")
+                return r.get("result")
+
+    def close(self):
+        try:
+            self._send_frame(8, b"")
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# Aides générées par le dépôt (réglages d'affichage) : si elles ne sont plus définies dans les packages, elles restent dans HA
+# comme entités « non fournies » (restored). On ne touche QU'À celles-là.
+CLEAN_ENTITY_PREFIXES = ("input_boolean.maison_",)
+# ressource (morceau de l'URL) → morceaux de texte qui prouvent qu'un dashboard l'utilise
+RESOURCE_MARKERS = {
+    "lovelace-mushroom": ["custom:mushroom-"], "mushroom": ["custom:mushroom-"],
+    "button-card": ["custom:button-card"], "swipe-card": ["custom:swipe-card"],
+    "clock-weather-card": ["custom:clock-weather-card"], "ha-today-card": ["custom:today-card"],
+    "atomic-calendar-revive": ["custom:atomic-calendar-revive"], "rss-accordion": ["custom:rss-accordion"],
+    "a-table": ["custom:a-table-card"], "stack-in-card": ["custom:stack-in-card"], "apexcharts-card": ["custom:apexcharts-card"],
+    "mini-graph-card": ["custom:mini-graph-card"], "fold-entity-row": ["custom:fold-entity-row"],
+    "hui-element": ["custom:hui-element"],
+    "layout-card": ["custom:layout-card", "view_layout", "custom:grid-layout", "custom:masonry-layout", "custom:vertical-layout",
+                    "custom:horizontal-layout", "layout:"],
+}
+RESOURCE_PROTECTED = ("browser_mod", "card-mod", "card_mod")      # jamais proposées à la suppression
+
+
+def orphan_helpers(registry, states, prefixes=CLEAN_ENTITY_PREFIXES):
+    """Entrées du registre qui ne correspondent plus à rien : préfixe de nos aides ET état « restauré » (non fourni)."""
+    restored = {s["entity_id"] for s in states if (s.get("attributes") or {}).get("restored") is True}
+    return sorted(e["entity_id"] for e in registry if e["entity_id"].startswith(prefixes) and e["entity_id"] in restored)
+
+
+def dashboards_text(cfg):
+    """Texte de tous les dashboards (YAML appliqués + dashboards créés dans l'interface), pour savoir quelles cartes servent."""
+    parts = []
+    for base in (cfg / "dashboards",):
+        if base.is_dir():
+            parts += [f.read_text(encoding="utf-8", errors="replace") for f in base.rglob("*.y*ml") if f.stat().st_size < 4_000_000]
+    sto = cfg / ".storage"
+    if sto.is_dir():
+        for f in sto.glob("lovelace*"):
+            if f.name not in ("lovelace_resources", "lovelace_dashboards") and f.stat().st_size < 8_000_000:
+                parts.append(f.read_text(encoding="utf-8", errors="replace"))
+    return "\n".join(parts).lower()
+
+
+def classify_resources(resources, corpus):
+    out = []
+    for r in resources:
+        url = r.get("url", "")
+        key = next((k for k in RESOURCE_MARKERS if k in url.lower()), None)
+        protected = any(p in url.lower() for p in RESOURCE_PROTECTED)
+        used = None if key is None else any(m in corpus for m in RESOURCE_MARKERS[key])
+        out.append({"id": r.get("id"), "url": url, "type": r.get("type"), "protected": protected, "used": used,
+                    "name": url.split("?")[0].rstrip("/").split("/")[-1] or url})
+    return out
+
+
+def clean_preview():
+    cfg = config_dir()
+    states = fetch_states()
+    if states is None:
+        raise SyncError("Impossible de lire les états de HA (API indisponible).")
+    ws = HAWebSocket()
+    try:
+        registry = ws.call(type="config/entity_registry/list")
+        try:
+            resources = ws.call(type="lovelace/resources")
+        except SyncError as e:           # dashboards en mode YAML : pas de ressources gérées par l'interface
+            resources, note = [], str(e)
+        else:
+            note = ""
+    finally:
+        ws.close()
+    orphans = orphan_helpers(registry, states)
+    res = classify_resources(resources, dashboards_text(cfg))
+    return {"orphans": orphans, "orphans_total": len(orphans), "resources": res, "note": note,
+            "unused": [r["id"] for r in res if r["used"] is False and not r["protected"]]}
+
+
+def clean_apply(body):
+    do_entities = bool(body.get("entities"))
+    wanted = set(body.get("resources") or [])
+    log = Run()
+    ws = HAWebSocket()
+    try:
+        if do_entities:
+            registry = ws.call(type="config/entity_registry/list")
+            states = fetch_states() or []
+            ids = orphan_helpers(registry, states)
+            gone = 0
+            for eid in ids:
+                try:
+                    ws.call(type="config/entity_registry/remove", entity_id=eid)
+                    gone += 1
+                except SyncError as e:
+                    log(f"⚠️ {eid} : {e}")
+            log(f"🧹 {gone} entité(s) orpheline(s) supprimée(s) sur {len(ids)}.")
+        if wanted:
+            resources = {r["id"]: r for r in ws.call(type="lovelace/resources")}
+            removed = []
+            for rid in wanted:
+                r = resources.get(rid)
+                if not r:
+                    log(f"⚠️ Ressource {rid} introuvable.")
+                elif any(p in r.get("url", "").lower() for p in RESOURCE_PROTECTED):
+                    log(f"🔒 {r['url']} : protégée, conservée.")
+                else:
+                    ws.call(type="lovelace/resources/delete", resource_id=rid)
+                    removed.append({"url": r.get("url"), "type": r.get("type")})
+                    log(f"🗑️ Ressource retirée : {r.get('url')}")
+            if removed:      # de quoi la remettre si besoin
+                DATA.mkdir(parents=True, exist_ok=True)
+                prev = []
+                f = DATA / "deleted_resources.json"
+                if f.exists():
+                    try:
+                        prev = json.loads(f.read_text(encoding="utf-8"))
+                    except ValueError:
+                        prev = []
+                f.write_text(json.dumps(prev + [{"date": time.strftime("%Y-%m-%d %H:%M"), **x} for x in removed], ensure_ascii=False, indent=1), encoding="utf-8")
+                log("ℹ️ Ferme et rouvre HA / l'application pour que les ressources retirées ne se chargent plus.")
+        if not do_entities and not wanted:
+            log("Rien n'était sélectionné.")
+    finally:
+        ws.close()
+    return {"log": log.lines}
 
 
 def restart():

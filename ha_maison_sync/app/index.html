@@ -53,13 +53,22 @@
       « Appliquer » copie les fichiers validés du dépôt dans HA, après sauvegarde, contrôle de la configuration et rechargement. « Brancher » ajoute (une seule fois) les quelques lignes de configuration.yaml qui activent le thème, les helpers et les dashboards.</div>
   </div>
 
+  <div class="card">
+    <h2>Nettoyage</h2>
+    <div class="row">
+      <button id="bCleanScan" class="sec">🔍 Chercher ce qui est inutile</button>
+    </div>
+    <div class="mut" style="margin-top:10px">Cherche les anciens réglages d'affichage (<code>input_boolean.maison_…</code>) qui ne sont plus définis dans la configuration, et les ressources de dashboards (cartes HACS) qu'aucun de tes dashboards n'utilise. Rien n'est supprimé sans ta confirmation.</div>
+    <div id="cleanBody"></div>
+  </div>
+
   <div class="card"><h2>Journal</h2><div id="out" class="mut">Aucune action pour l'instant.</div></div>
 </div>
 
 <script>
 const $ = s => document.querySelector(s);
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-const buttons = ['bExport','bPreview','bApply','bWire','bRollback','bRestart','bRefresh'];
+const buttons = ['bExport','bPreview','bApply','bWire','bRollback','bRestart','bRefresh','bCleanScan'];
 function busy(b){ buttons.forEach(id => $('#'+id).disabled = b); }
 
 async function api(path, body){
@@ -139,6 +148,38 @@ $('#bRollback').onclick = () => run('api/rollback', {}, 'Restaurer l\'état d\'a
 $('#bRestart').onclick  = () => run('api/restart', {}, 'Redémarrer Home Assistant maintenant ?');
 $('#bRefresh').onclick  = refresh;
 refresh();
+
+// ───── Nettoyage ─────
+$('#bCleanScan').onclick = async () => {
+  busy(true); $('#cleanBody').innerHTML = '<div class="mut" style="margin-top:10px">Analyse en cours…</div>';
+  try{
+    const r = await api('api/clean_preview', {});
+    if(!r.ok){ $('#cleanBody').innerHTML = '<div class="ko" style="margin-top:10px">❌ '+esc(r.error)+'</div>'; busy(false); return; }
+    let h = '<div style="margin-top:12px">';
+    h += r.orphans_total
+      ? '<label><input type="checkbox" id="cEnt" checked> Supprimer <b>'+r.orphans_total+'</b> ancien(s) réglage(s) d\'affichage qui n\'existent plus</label><details><summary>Voir quelques exemples</summary><pre>'+esc(r.orphans.slice(0,15).join('\n'))+(r.orphans_total>15?'\n…':'')+'</pre></details>'
+      : '<div class="ok">✅ Aucun ancien réglage orphelin.</div>';
+    h += '<div style="margin-top:12px"><b>Ressources de dashboards</b></div>';
+    if(r.note) h += '<div class="warn">'+esc(r.note)+'</div>';
+    (r.resources||[]).forEach(x => {
+      const st = x.protected ? '🔒 protégée' : x.used === false ? '<span class="warn">inutilisée</span>' : x.used === true ? '<span class="ok">utilisée</span>' : '<span class="mut">non analysée</span>';
+      const can = !x.protected && x.used === false;
+      h += '<div><label><input type="checkbox" class="cRes" value="'+esc(x.id)+'" '+(can?'checked':'')+(x.protected?' disabled':'')+'> <code>'+esc(x.name)+'</code> — '+st+'</label></div>';
+    });
+    h += '<div class="row" style="margin-top:14px"><button id="bCleanApply" class="danger">🧹 Nettoyer la sélection</button></div>';
+    h += '</div>';
+    $('#cleanBody').innerHTML = h;
+    $('#bCleanApply').onclick = async () => {
+      const ids = [...document.querySelectorAll('.cRes:checked')].map(x => x.value);
+      const ent = !!($('#cEnt') && $('#cEnt').checked);
+      if(!ent && !ids.length){ alert('Rien n\'est coché.'); return; }
+      if(!confirm('Supprimer '+(ent?r.orphans_total+' réglage(s) orphelin(s)':'')+(ent&&ids.length?' et ':'')+(ids.length?ids.length+' ressource(s)':'')+' ?\n(Les ressources retirées sont notées dans /data/deleted_resources.json pour pouvoir les remettre.)')) return;
+      await run('api/clean_apply', {entities: ent, resources: ids});
+      $('#cleanBody').innerHTML = '';
+    };
+  }catch(e){ $('#cleanBody').innerHTML = '<div class="ko">❌ '+esc(e.message)+'</div>'; }
+  busy(false);
+};
 </script>
 </body>
 </html>

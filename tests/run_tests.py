@@ -167,5 +167,109 @@ except sync.SyncError:
 sync.core_check = real
 ok(sync.wire_apply()["changed"] == ["configuration.yaml"] and sync.wire_apply()["changed"] == [], "branchement appliqué puis idempotent")
 
+# ───────── nettoyage : détection + client WebSocket (faux serveur local) ─────────
+import base64, hashlib, socket, struct, threading  # noqa: E402
+
+reg = [{"entity_id": f"input_boolean.maison_h_{i}"} for i in range(3)] + [{"entity_id": "input_boolean.camdetect_alarme"}, {"entity_id": "input_boolean.maison_r_cuisine"}]
+sts = [{"entity_id": "input_boolean.maison_h_0", "attributes": {"restored": True}}, {"entity_id": "input_boolean.maison_h_1", "attributes": {}},
+       {"entity_id": "input_boolean.maison_h_2", "attributes": {"restored": True}}, {"entity_id": "input_boolean.camdetect_alarme", "attributes": {"restored": True}},
+       {"entity_id": "input_boolean.maison_r_cuisine", "attributes": {}}]
+ok(sync.orphan_helpers(reg, sts) == ["input_boolean.maison_h_0", "input_boolean.maison_h_2"],
+   "orphelins : seulement nos aides « maison_ » à l'état restauré (une aide encore définie et un helper à toi sont épargnés)")
+res = [{"id": "1", "url": "/local/community/button-card/button-card.js?v=1", "type": "module"}, {"id": "2", "url": "/local/community/apexcharts-card/apexcharts-card.js", "type": "module"},
+       {"id": "3", "url": "/local/community/lovelace-card-mod/card-mod.js", "type": "module"}, {"id": "4", "url": "/local/autre/mystere.js", "type": "module"},
+       {"id": "5", "url": "/local/community/lovelace-layout-card/layout-card.js", "type": "module"}]
+cl = {r["id"]: r for r in sync.classify_resources(res, "type: custom:button-card\nlayout: responsive\n".lower())}
+ok(cl["1"]["used"] is True and cl["2"]["used"] is False and cl["3"]["protected"] and cl["4"]["used"] is None,
+   "ressources : utilisée / inutilisée / protégée (card-mod) / inconnue (non analysée)")
+ok(cl["5"]["used"] is True, "ressources : layout-card reconnue par « layout: » (précaution : on ne la propose pas à tort)")
+(cfg / "dashboards").mkdir(exist_ok=True)
+(cfg / "dashboards" / "d.yaml").write_text("views:\n- cards:\n  - type: custom:swipe-card\n")
+(cfg / ".storage" / "lovelace.test").write_text('{"type": "custom:stack-in-card"}')
+corpus = sync.dashboards_text(cfg)
+ok("custom:swipe-card" in corpus and "custom:stack-in-card" in corpus, "texte des dashboards : YAML appliqués + dashboards de l'interface")
+
+
+class FakeHA(threading.Thread):
+    """Faux WebSocket HA : authentification + 3 commandes (registre, ressources, suppression)."""
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.srv = socket.socket(); self.srv.bind(("127.0.0.1", 0)); self.srv.listen(1)
+        self.port = self.srv.getsockname()[1]; self.removed = []; self.resources = [dict(r) for r in res]
+
+    def send(self, c, obj):
+        raw = json.dumps(obj).encode(); n = len(raw)
+        c.sendall(bytes([0x81]) + (bytes([n]) if n < 126 else bytes([126]) + struct.pack(">H", n) if n < 65536 else bytes([127]) + struct.pack(">Q", n)) + raw)
+
+    def recv(self, c):
+        def rd(k):
+            b = b""
+            while len(b) < k:
+                x = c.recv(k - len(b))
+                if not x:
+                    raise EOFError
+                b += x
+            return b
+        b0, b1 = rd(2); n = b1 & 0x7F
+        n = struct.unpack(">H", rd(2))[0] if n == 126 else struct.unpack(">Q", rd(8))[0] if n == 127 else n
+        mask = rd(4); data = bytes(x ^ mask[i % 4] for i, x in enumerate(rd(n)))
+        return (b0 & 0x0F), data
+
+    def run(self):
+        c, _ = self.srv.accept()
+        req = b""
+        while b"\r\n\r\n" not in req:
+            req += c.recv(1024)
+        key = [l.split(b": ")[1] for l in req.split(b"\r\n") if l.lower().startswith(b"sec-websocket-key")][0]
+        acc = base64.b64encode(hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+        c.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + acc + b"\r\n\r\n")
+        self.send(c, {"type": "auth_required"})
+        _, d = self.recv(c)
+        self.send(c, {"type": "auth_ok"} if json.loads(d).get("access_token") == "TOKEN" else {"type": "auth_invalid"})
+        try:
+            while True:
+                op, d = self.recv(c)
+                if op == 8:
+                    break
+                m = json.loads(d)
+                t = m["type"]
+                if t == "config/entity_registry/list":
+                    r = {"id": m["id"], "type": "result", "success": True, "result": [{"entity_id": f"input_boolean.maison_h_{i}"} for i in range(300)]}
+                elif t == "lovelace/resources":
+                    r = {"id": m["id"], "type": "result", "success": True, "result": self.resources}
+                elif t in ("config/entity_registry/remove", "lovelace/resources/delete"):
+                    self.removed.append(m.get("entity_id") or m.get("resource_id"))
+                    r = {"id": m["id"], "type": "result", "success": True, "result": None}
+                else:
+                    r = {"id": m["id"], "type": "result", "success": False, "error": {"message": "inconnu"}}
+                self.send(c, r)
+        except EOFError:
+            pass
+
+
+fh = FakeHA(); fh.start()
+os.environ["HA_MAISON_WS_URL"] = f"ws://127.0.0.1:{fh.port}/websocket"; os.environ["HA_MAISON_WS_TOKEN"] = "TOKEN"
+w = sync.HAWebSocket()
+ok(len(w.call(type="config/entity_registry/list")) == 300, "WebSocket : authentification + réponse de grande taille (trames > 125 octets)")
+try:
+    w.call(type="n_importe_quoi"); ok(False, "une commande refusée aurait dû lever une erreur")
+except sync.SyncError as e:
+    ok("inconnu" in str(e), "WebSocket : erreur de HA remontée clairement")
+w.close()
+os.environ["HA_MAISON_WS_TOKEN"] = "MAUVAIS"
+fh2 = FakeHA(); fh2.start(); os.environ["HA_MAISON_WS_URL"] = f"ws://127.0.0.1:{fh2.port}/websocket"
+try:
+    sync.HAWebSocket(); ok(False, "mauvais jeton accepté")
+except sync.SyncError:
+    ok(True, "WebSocket : mauvais jeton refusé")
+os.environ["HA_MAISON_WS_TOKEN"] = "TOKEN"
+fh3 = FakeHA(); fh3.start(); os.environ["HA_MAISON_WS_URL"] = f"ws://127.0.0.1:{fh3.port}/websocket"
+sync.fetch_states = lambda: [{"entity_id": f"input_boolean.maison_h_{i}", "attributes": {"restored": i < 250}} for i in range(300)]
+out = sync.clean_apply({"entities": True, "resources": ["2", "3", "999"]})
+txt = "\n".join(out["log"])
+ok(len([x for x in fh3.removed if str(x).startswith("input_boolean")]) == 250, "nettoyage : 250 orphelins supprimés, les 50 encore définis conservés")
+ok("2" in fh3.removed and "3" not in fh3.removed and "protégée" in txt and "introuvable" in txt, "nettoyage : ressource retirée, card-mod protégée, id inconnu signalé")
+ok(json.loads((sync.DATA / "deleted_resources.json").read_text())[0]["url"].endswith("apexcharts-card.js"), "nettoyage : ressource retirée notée pour pouvoir la remettre")
+
 print("\nÉCHECS :", fails or "aucun")
 sys.exit(1 if fails else 0)
