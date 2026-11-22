@@ -271,5 +271,32 @@ ok(len([x for x in fh3.removed if str(x).startswith("input_boolean")]) == 250, "
 ok("2" in fh3.removed and "3" not in fh3.removed and "protégée" in txt and "introuvable" in txt, "nettoyage : ressource retirée, card-mod protégée, id inconnu signalé")
 ok(json.loads((sync.DATA / "deleted_resources.json").read_text())[0]["url"].endswith("apexcharts-card.js"), "nettoyage : ressource retirée notée pour pouvoir la remettre")
 
+# ── anciennes automatisations remplacées (cleanup.json) ──
+import tempfile as _tf, pathlib as _pl
+_repo = _pl.Path(_tf.mkdtemp())
+(_repo / "cleanup.json").write_text(json.dumps({"automations": [
+    {"alias": "Vieille A", "remplace_par": "n1"},
+    {"alias": "Vieille B", "remplace_par": "n2"},      # remplaçante absente -> on garde l'ancienne
+    {"alias": "Vieille C", "remplace_par": "n3"}]}))   # remplaçante indisponible -> on garde
+_st = [
+    {"entity_id": "automation.vieille_a", "state": "on", "attributes": {"friendly_name": "Vieille A", "id": "111"}},
+    {"entity_id": "automation.nouvelle_a", "state": "on", "attributes": {"friendly_name": "Nouvelle A", "id": "n1"}},
+    {"entity_id": "automation.vieille_b", "state": "on", "attributes": {"friendly_name": "Vieille B", "id": "222"}},
+    {"entity_id": "automation.vieille_c", "state": "on", "attributes": {"friendly_name": "Vieille C", "id": "333"}},
+    {"entity_id": "automation.nouvelle_c", "state": "unavailable", "attributes": {"friendly_name": "Nouvelle C", "id": "n3"}},
+]
+_r = sync.replaced_automations(_st, _repo)
+ok([a["id"] for a in _r] == ["111"], "automatisations : seule celle dont la remplaçante est chargée est proposée")
+_calls = []
+_orig = sync._call
+sync._call = lambda url, method="GET", body=None, timeout=60, raw=False: (_calls.append((method, url)) or {"status": 200, "json": {"alias": "x"}})
+sync.REPO, _old_repo = _repo, sync.REPO
+_lg = []
+n = sync.delete_replaced_automations(_st, _lg.append)
+sync.REPO, sync._call = _old_repo, _orig
+ok(n == 1 and ("DELETE", "http://supervisor/core/api/config/automation/config/111") in _calls and not any("222" in u or "333" in u for _, u in _calls),
+   "automatisations : suppression via l'API HA, les autres intactes")
+ok(json.loads((sync.DATA / "deleted_automations.json").read_text())[0]["alias"] == "Vieille A", "automatisations : copie gardée pour pouvoir la restaurer")
+
 print("\nÉCHECS :", fails or "aucun")
 sys.exit(1 if fails else 0)

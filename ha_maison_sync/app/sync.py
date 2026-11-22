@@ -414,25 +414,37 @@ def redact(line):
     return line
 
 
-def collect_errors(cfg, max_lines=400):
-    f = cfg / "home-assistant.log"
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def collect_errors(cfg, max_lines=400, why=None):
+    """Erreurs/avertissements récents. `why` (liste) reçoit la raison quand le journal est introuvable."""
+    why = why if why is not None else []
     text = None
+    f = cfg / "home-assistant.log"
     if f.is_file() and not f.is_symlink():
         try:
             with open(f, "rb") as fh:
                 fh.seek(0, os.SEEK_END)
                 fh.seek(max(0, fh.tell() - 2_000_000))
                 text = fh.read().decode("utf-8", errors="replace")
-        except OSError:
-            text = None
-    if text is None:
-        r = _call("http://supervisor/core/logs", raw=True)
-        if r and r["status"] == 200:
-            text = r.get("text", "")
+        except OSError as e:
+            why.append(f"home-assistant.log illisible ({e})")
+    if not text:
+        for url in ("http://supervisor/core/logs/latest", "http://supervisor/core/logs", "http://supervisor/core/logs/boots/0"):
+            r = _call(url, raw=True, timeout=30)
+            if r is None:
+                why.append("pas de jeton Supervisor")
+                break
+            if r["status"] == 200 and r.get("text"):
+                text = r["text"]
+                break
+            why.append(f"{url.rsplit('/', 2)[-2] + '/' + url.rsplit('/', 1)[-1]} : HTTP {r['status']}")
     if not text:
         return None
     keep, on = [], False
-    for line in text.splitlines()[-3000:]:
+    for line in text.splitlines()[-4000:]:
+        line = ANSI.sub("", line)
         m = LOG_LEVEL.match(line)
         if m:
             on = m.group(1) in ("ERROR", "WARNING", "CRITICAL")
@@ -474,8 +486,11 @@ def export_full(cfg, ex, log, skipped):
     if names is not None:
         (ex / "secrets_keys.txt").write_text("# Noms des secrets (valeurs jamais envoyées)\n" + "\n".join(names) + "\n", encoding="utf-8")
         parts.append(f"{len(names)} nom(s) de secrets")
-    errs = collect_errors(cfg)
-    if errs is not None:
+    why = []
+    errs = collect_errors(cfg, why=why)
+    if errs is None:
+        parts.append("journal d'erreurs INDISPONIBLE (" + ("; ".join(why) or "aucune source") + ")")
+    else:
         (ex / "logs").mkdir(exist_ok=True)
         (ex / "logs" / "errors.log").write_text(errs, encoding="utf-8")
         parts.append(f"journal d'erreurs ({len(errs.splitlines())} lignes, masqué)")
@@ -807,6 +822,12 @@ def apply():
         _restore(snap, cfg, log)
         raise SyncError(f"Application annulée et fichiers restaurés. Détail : {e}") from e
     reload_for(changed, log)
+    try:     # supprime tout seul les anciennes automatisations de l'interface que les packages remplacent
+        if (REPO / "cleanup.json").is_file():
+            time.sleep(3)
+            delete_replaced_automations(fetch_states(), log)
+    except Exception as e:  # ne doit jamais faire échouer l'application
+        log(f"⚠️ Nettoyage des anciennes automatisations ignoré : {e}")
     if o["restart_after_apply"]:
         core_restart(log)
     st["last_applied"] = sha
@@ -1216,7 +1237,8 @@ def clean_preview():
         ws.close()
     orphans = orphan_helpers(registry, states)
     res = classify_resources(resources, dashboards_text(cfg))
-    return {"orphans": orphans, "orphans_total": len(orphans), "resources": res, "note": note,
+    autos = replaced_automations(states)
+    return {"orphans": orphans, "orphans_total": len(orphans), "resources": res, "note": note, "automations": autos,
             "unused": [r["id"] for r in res if r["used"] is False and not r["protected"]]}
 
 
@@ -1262,11 +1284,65 @@ def clean_apply(body):
                         prev = []
                 f.write_text(json.dumps(prev + [{"date": time.strftime("%Y-%m-%d %H:%M"), **x} for x in removed], ensure_ascii=False, indent=1), encoding="utf-8")
                 log("ℹ️ Ferme et rouvre HA / l'application pour que les ressources retirées ne se chargent plus.")
-        if not do_entities and not wanted:
+        if body.get("automations"):
+            delete_replaced_automations(fetch_states(), log)
+        if not do_entities and not wanted and not body.get("automations"):
             log("Rien n'était sélectionné.")
     finally:
         ws.close()
     return {"log": log.lines}
+
+
+# ───────────────────────── automatisations de l'interface remplacées par un package ─────────────────────────
+# Le dépôt contient `cleanup.json` : {"automations": [{"alias": "…", "remplace_par": "<id de l'automatisation du package>"}]}.
+# Une ancienne automatisation n'est supprimée que si sa remplaçante existe ET est chargée dans HA (jamais l'inverse).
+def replaced_automations(states, repo=None):
+    f = (repo or REPO) / "cleanup.json"
+    if not f.is_file():
+        return []
+    try:
+        wanted = json.loads(f.read_text(encoding="utf-8")).get("automations", [])
+    except ValueError:
+        return []
+    by_name = {}
+    for st in states or []:
+        if st["entity_id"].startswith("automation."):
+            by_name.setdefault((st.get("attributes") or {}).get("friendly_name"), []).append(st)
+    live = {(st.get("attributes") or {}).get("id"): st for sts in by_name.values() for st in sts}
+    out = []
+    for w in wanted:
+        new = live.get(w.get("remplace_par"))
+        if not new or new.get("state") == "unavailable":
+            continue
+        for old in by_name.get(w.get("alias"), []):
+            oid = (old.get("attributes") or {}).get("id")
+            if oid and old["entity_id"] != new["entity_id"]:
+                out.append({"alias": w["alias"], "entity_id": old["entity_id"], "id": oid, "remplace_par": new["entity_id"]})
+    return out
+
+
+def delete_replaced_automations(states, log):
+    todo = replaced_automations(states)
+    gone, saved = 0, []
+    for a in todo:
+        url = f"http://supervisor/core/api/config/automation/config/{urllib.parse.quote(str(a['id']), safe='')}"
+        cur = _call(url)
+        r = _call(url, "DELETE")
+        if r and r["status"] in (200, 204):
+            gone += 1
+            saved.append({"date": time.strftime("%Y-%m-%d %H:%M"), "alias": a["alias"], "config": (cur or {}).get("json")})
+            log(f"🗑️ Ancienne automatisation supprimée : {a['alias']} (remplacée par {a['remplace_par']})")
+        else:
+            log(f"⚠️ {a['alias']} : suppression impossible ({r['status'] if r else 'API indisponible'}).")
+    if saved:
+        f = DATA / "deleted_automations.json"
+        try:
+            prev = json.loads(f.read_text(encoding="utf-8")) if f.exists() else []
+        except ValueError:
+            prev = []
+        DATA.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(prev + saved, ensure_ascii=False, indent=1), encoding="utf-8")
+    return gone
 
 
 def restart():

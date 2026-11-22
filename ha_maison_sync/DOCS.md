@@ -22,3 +22,5 @@
 
 ## Nettoyage
 Carte « Nettoyage » : détecte les helpers `input_boolean.maison_*` orphelins et les ressources Lovelace inutilisées (ex. apexcharts-card), puis les supprime après ta confirmation (cases à cocher). `card-mod` et `browser_mod` sont protégées. Les ressources retirées sont journalisées dans `/data/deleted_resources.json`. Ferme et rouvre l'application HA ensuite.
+
+Les anciennes automatisations créées dans l'interface et remplacées par un package sont supprimées automatiquement à « Appliquer » (liste dans `cleanup.json` du dépôt ; sauvegarde dans `/data/deleted_automations.json`).

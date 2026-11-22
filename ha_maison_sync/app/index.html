@@ -159,6 +159,10 @@ $('#bCleanScan').onclick = async () => {
     h += r.orphans_total
       ? '<label><input type="checkbox" id="cEnt" checked> Supprimer <b>'+r.orphans_total+'</b> ancien(s) réglage(s) d\'affichage qui n\'existent plus</label><details><summary>Voir quelques exemples</summary><pre>'+esc(r.orphans.slice(0,15).join('\n'))+(r.orphans_total>15?'\n…':'')+'</pre></details>'
       : '<div class="ok">✅ Aucun ancien réglage orphelin.</div>';
+    const au = r.automations||[];
+    h += au.length
+      ? '<div style="margin-top:12px"><label><input type="checkbox" id="cAut" checked> Supprimer <b>'+au.length+'</b> ancienne(s) automatisation(s) remplacée(s)</label><details><summary>Voir la liste</summary><pre>'+esc(au.map(a=>a.alias+'  →  '+a.remplace_par).join('\n'))+'</pre></details></div>'
+      : '<div class="ok" style="margin-top:8px">✅ Aucune ancienne automatisation à supprimer.</div>';
     h += '<div style="margin-top:12px"><b>Ressources de dashboards</b></div>';
     if(r.note) h += '<div class="warn">'+esc(r.note)+'</div>';
     (r.resources||[]).forEach(x => {
@@ -171,10 +175,10 @@ $('#bCleanScan').onclick = async () => {
     $('#cleanBody').innerHTML = h;
     $('#bCleanApply').onclick = async () => {
       const ids = [...document.querySelectorAll('.cRes:checked')].map(x => x.value);
-      const ent = !!($('#cEnt') && $('#cEnt').checked);
-      if(!ent && !ids.length){ alert('Rien n\'est coché.'); return; }
-      if(!confirm('Supprimer '+(ent?r.orphans_total+' réglage(s) orphelin(s)':'')+(ent&&ids.length?' et ':'')+(ids.length?ids.length+' ressource(s)':'')+' ?\n(Les ressources retirées sont notées dans /data/deleted_resources.json pour pouvoir les remettre.)')) return;
-      await run('api/clean_apply', {entities: ent, resources: ids});
+      const ent = !!($('#cEnt') && $('#cEnt').checked); const aut = !!($('#cAut') && $('#cAut').checked);
+      if(!ent && !aut && !ids.length){ alert('Rien n\'est coché.'); return; }
+      if(!confirm('Supprimer '+(ent?r.orphans_total+' réglage(s) orphelin(s)':'')+(aut?(ent?', ':'')+au.length+' automatisation(s)':'')+((ent||aut)&&ids.length?' et ':'')+(ids.length?ids.length+' ressource(s)':'')+' ?\n(Les ressources retirées sont notées dans /data/deleted_resources.json pour pouvoir les remettre.)')) return;
+      await run('api/clean_apply', {entities: ent, automations: aut, resources: ids});
       $('#cleanBody').innerHTML = '';
     };
   }catch(e){ $('#cleanBody').innerHTML = '<div class="ko">❌ '+esc(e.message)+'</div>'; }
