@@ -237,6 +237,9 @@ class FakeHA(threading.Thread):
                     r = {"id": m["id"], "type": "result", "success": True, "result": [{"entity_id": f"input_boolean.maison_h_{i}"} for i in range(300)]}
                 elif t == "lovelace/resources":
                     r = {"id": m["id"], "type": "result", "success": True, "result": self.resources}
+                elif t == "config/entity_registry/update":
+                    self.updated = getattr(self, "updated", []) + [(m["entity_id"], m.get("disabled_by"))]
+                    r = {"id": m["id"], "type": "result", "success": True, "result": {}}
                 elif t in ("config/entity_registry/remove", "lovelace/resources/delete"):
                     self.removed.append(m.get("entity_id") or m.get("resource_id"))
                     r = {"id": m["id"], "type": "result", "success": True, "result": None}
@@ -297,6 +300,23 @@ sync.REPO, sync._call = _old_repo, _orig
 ok(n == 1 and ("DELETE", "http://supervisor/core/api/config/automation/config/111") in _calls and not any("222" in u or "333" in u for _, u in _calls),
    "automatisations : suppression via l'API HA, les autres intactes")
 ok(json.loads((sync.DATA / "deleted_automations.json").read_text())[0]["alias"] == "Vieille A", "automatisations : copie gardée pour pouvoir la restaurer")
+
+# ── désactivation d'entités par règles (cleanup.json) ──
+_repo2 = _pl.Path(_tf.mkdtemp())
+(_repo2 / "cleanup.json").write_text(json.dumps({"disable_entities": ["number.a", "re:sensor\\.eb_.*timer.*", "re:.*"]}))
+_reg = [{"entity_id": "number.a"}, {"entity_id": "number.b", "disabled_by": "user"}, {"entity_id": "sensor.eb_x_timer_1"}, {"entity_id": "sensor.eb_x_val"}]
+_ids = sync.entities_to_disable(_reg, _repo2)
+ok(_ids == ["number.a", "sensor.eb_x_timer_1", "sensor.eb_x_val"], "désactivation : règles exactes et « re: » appliquées, entité déjà désactivée ignorée")
+(_repo2 / "cleanup.json").write_text(json.dumps({"disable_entities": ["number.a", "re:sensor\\.eb_.*timer.*"]}))
+_ids = sync.entities_to_disable(_reg, _repo2)
+ok(_ids == ["number.a", "sensor.eb_x_timer_1"], "désactivation : seules les entités visées")
+_lg2 = []
+fh2 = FakeHA(); fh2.start()
+os.environ["HA_MAISON_WS_URL"] = f"ws://127.0.0.1:{fh2.port}/websocket"
+_ws = sync.HAWebSocket()
+n2 = sync.disable_entities(_ws, _ids, _lg2.append); _ws.close()
+ok(n2 == 2 and fh2.updated == [("number.a", "user"), ("sensor.eb_x_timer_1", "user")], "désactivation : appel HA config/entity_registry/update avec disabled_by=user")
+ok(sync.disable_entities(None, ["x"] * 401, _lg2.append) == 0, "désactivation : garde-fou au-delà de 400 entités")
 
 print("\nÉCHECS :", fails or "aucun")
 sys.exit(1 if fails else 0)

@@ -826,6 +826,11 @@ def apply():
         if (REPO / "cleanup.json").is_file():
             time.sleep(3)
             delete_replaced_automations(fetch_states(), log)
+            ws = HAWebSocket()
+            try:
+                disable_entities(ws, entities_to_disable(ws.call(type="config/entity_registry/list")), log)
+            finally:
+                ws.close()
     except Exception as e:  # ne doit jamais faire échouer l'application
         log(f"⚠️ Nettoyage des anciennes automatisations ignoré : {e}")
     if o["restart_after_apply"]:
@@ -1238,7 +1243,7 @@ def clean_preview():
     orphans = orphan_helpers(registry, states)
     res = classify_resources(resources, dashboards_text(cfg))
     autos = replaced_automations(states)
-    return {"orphans": orphans, "orphans_total": len(orphans), "resources": res, "note": note, "automations": autos,
+    return {"orphans": orphans, "orphans_total": len(orphans), "resources": res, "note": note, "automations": autos, "to_disable": entities_to_disable(registry),
             "unused": [r["id"] for r in res if r["used"] is False and not r["protected"]]}
 
 
@@ -1286,7 +1291,9 @@ def clean_apply(body):
                 log("ℹ️ Ferme et rouvre HA / l'application pour que les ressources retirées ne se chargent plus.")
         if body.get("automations"):
             delete_replaced_automations(fetch_states(), log)
-        if not do_entities and not wanted and not body.get("automations"):
+        if body.get("disable"):
+            disable_entities(ws, entities_to_disable(ws.call(type="config/entity_registry/list")), log)
+        if not do_entities and not wanted and not body.get("automations") and not body.get("disable"):
             log("Rien n'était sélectionné.")
     finally:
         ws.close()
@@ -1343,6 +1350,50 @@ def delete_replaced_automations(states, log):
         DATA.mkdir(parents=True, exist_ok=True)
         f.write_text(json.dumps(prev + saved, ensure_ascii=False, indent=1), encoding="utf-8")
     return gone
+
+
+# ───────────────────────── entités à désactiver (règles du dépôt) ─────────────────────────
+# `cleanup.json` : {"disable_entities": ["number.xxx", "re:sensor\\.heating_ebusd_.*timer.*"]}
+# Un identifiant exact, ou « re: » + une expression régulière qui doit correspondre à TOUT l'identifiant.
+# Désactiver est réversible (réactiver l'entité dans HA). On ne touche qu'aux entités encore actives.
+DISABLE_MAX = 400
+
+
+def entities_to_disable(registry, repo=None):
+    f = (repo or REPO) / "cleanup.json"
+    if not f.is_file():
+        return []
+    try:
+        rules = json.loads(f.read_text(encoding="utf-8")).get("disable_entities", [])
+    except ValueError:
+        return []
+    exact = {r for r in rules if isinstance(r, str) and not r.startswith("re:")}
+    pats = []
+    for r in rules:
+        if isinstance(r, str) and r.startswith("re:"):
+            try:
+                pats.append(re.compile(r[3:]))
+            except re.error:
+                pass
+    out = sorted(e["entity_id"] for e in registry
+                 if not e.get("disabled_by") and (e["entity_id"] in exact or any(p.fullmatch(e["entity_id"]) for p in pats)))
+    return out
+
+
+def disable_entities(ws, ids, log):
+    if len(ids) > DISABLE_MAX:
+        log(f"⚠️ {len(ids)} entités à désactiver : au-delà de {DISABLE_MAX}, je m'arrête par sécurité (règle trop large ?).")
+        return 0
+    done = 0
+    for eid in ids:
+        try:
+            ws.call(type="config/entity_registry/update", entity_id=eid, disabled_by="user")
+            done += 1
+        except SyncError as e:
+            log(f"⚠️ {eid} : {e}")
+    if ids:
+        log(f"🔕 {done} entité(s) désactivée(s) sur {len(ids)} (réversible : réactive-les dans HA si besoin).")
+    return done
 
 
 def restart():

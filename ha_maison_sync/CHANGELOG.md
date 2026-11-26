@@ -1,3 +1,6 @@
+## 0.7.0
+- « Appliquer » désactive aussi les entités listées dans `cleanup.json` (`disable_entities` : identifiants exacts ou `re:expression`), par exemple les réglages modifiables inutiles d'ebusd. Réversible (réactive l'entité dans HA). Garde-fou : jamais plus de 400 entités d'un coup. La carte « Nettoyage » propose la même désactivation.
+
 ## 0.6.0
 - « Appliquer » supprime maintenant tout seul les anciennes automatisations de l'interface que le dépôt remplace (fichier `cleanup.json` du dépôt). Garde-fous : la remplaçante doit être chargée dans HA ; une copie de l'ancienne est gardée dans `/data/deleted_automations.json`. La carte « Nettoyage » propose aussi cette suppression.
 - Export : le journal d'erreurs essaie plusieurs sources (fichier, `core/logs/latest`, `core/logs`), retire les codes couleur, et indique la raison dans le journal d'envoi s'il reste introuvable.
