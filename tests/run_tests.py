@@ -345,5 +345,13 @@ ok("filter_entity_id=select.mode%2Csensor.depart" in _calls3[0] and "no_attribut
 _lg4 = []; sync.export_history(_ex3, _lg4.append, repo=_pl.Path(_tf.mkdtemp()), now=_now)
 ok(not (_ex3 / "history").exists(), "historique : sans observation.json, rien n'est exporté (et l'ancien export est retiré)")
 
+# ── fichiers supplémentaires demandés par le dépôt (apply_extra.json) ──
+_repo5 = _pl.Path(_tf.mkdtemp())
+(_repo5 / "apply_extra.json").write_text(json.dumps({"paths": ["esphome/nspanel.yaml", "www/nspanel", "esphome", "esphome/secrets.yaml",
+                                                              "../etc/passwd", "configuration.yaml", "www/.cache/x", "esphome/sous/x.yaml"]}))
+ok(sync.extra_apply_paths(_repo5) == ["esphome/nspanel.yaml", "www/nspanel"],
+   "apply_extra : seuls esphome/<fichier>.yaml et www/… sont acceptés (ni dossier esphome entier, ni secrets, ni chemin sortant)")
+ok(sync.extra_apply_paths(_pl.Path(_tf.mkdtemp())) == [], "apply_extra : absent → rien de plus")
+
 print("\nÉCHECS :", fails or "aucun")
 sys.exit(1 if fails else 0)

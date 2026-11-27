@@ -80,6 +80,36 @@ def apply_paths(o):
         if pp.parts[0] in FORBIDDEN_APPLY or str(pp) in FORBIDDEN_APPLY:
             raise SyncError(f"« {p} » ne peut pas être appliqué (protégé).")
         out.append(str(pp))
+    for p in extra_apply_paths():
+        if p not in out:
+            out.append(p)
+    return out
+
+
+# Fichiers supplémentaires que le DÉPÔT demande d'appliquer (apply_extra.json), en plus des options de l'add-on :
+# uniquement un fichier esphome/<nom>.yaml précis (firmware d'un appareil) ou un dossier/fichier sous www/ (servi à /local/).
+# Jamais secrets.yaml, jamais un dossier esphome/ entier (les autres appareils ne sont pas touchés).
+def extra_apply_paths(repo=None):
+    f = (repo or REPO) / "apply_extra.json"
+    if not f.is_file():
+        return []
+    try:
+        wanted = json.loads(f.read_text(encoding="utf-8")).get("paths", [])
+    except ValueError:
+        return []
+    out = []
+    for p in wanted:
+        try:
+            pp = safe_rel(p)
+        except SyncError:
+            continue
+        parts = pp.parts
+        if "secrets.yaml" in parts or any(x.startswith(".") for x in parts):
+            continue
+        ok_esphome = len(parts) == 2 and parts[0] == "esphome" and parts[1].endswith(".yaml")
+        ok_www = len(parts) >= 2 and parts[0] == "www"
+        if ok_esphome or ok_www:
+            out.append(str(pp))
     return out
 
 
@@ -465,6 +495,11 @@ def export_system(out):
     if r and r["status"] == 200:
         info["addons"] = [{"name": a.get("name"), "slug": a.get("slug"), "version": a.get("version"), "state": a.get("state")}
                           for a in ((r["json"] or {}).get("data") or {}).get("addons", [])]
+    r = _call("http://supervisor/network/info")      # adresses IP locales de HA (ex. pour qu'un appareil télécharge un fichier de /local)
+    if r and r["status"] == 200:
+        ifs = ((r["json"] or {}).get("data") or {}).get("interfaces") or []
+        info["network"] = [{"interface": i.get("interface"), "ipv4": (i.get("ipv4") or {}).get("address") or []}
+                           for i in ifs if i.get("enabled") and (i.get("ipv4") or {}).get("address")]
     if info:
         out.mkdir(parents=True, exist_ok=True)
         (out / "system.json").write_text(json.dumps(info, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
@@ -837,6 +872,8 @@ def make_plan(o, sha):
         delete = [f for f in out.splitlines() if (cfg / f).is_file() and not (cfg / f).is_symlink()]
     diffs = {}
     for rel in mod:
+        if not rel.endswith((".yaml", ".yml", ".json", ".txt", ".md", ".js", ".css", ".html")):
+            continue                     # fichiers binaires (ex. écran .tft) : pas de différence ligne à ligne
         try:
             a = (cfg / rel).read_text(encoding="utf-8", errors="replace").splitlines()
             b = (REPO / rel).read_text(encoding="utf-8", errors="replace").splitlines()

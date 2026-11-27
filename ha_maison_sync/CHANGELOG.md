@@ -1,3 +1,8 @@
+## 0.9.0
+- « Appliquer » applique aussi les fichiers que le dépôt liste dans `apply_extra.json` : un fichier `esphome/<nom>.yaml` précis (firmware d'un appareil ESPHome) et des fichiers sous `www/` (servis par HA à `/local/…`, ex. l'écran du NSPanel). Jamais `secrets.yaml` ni le dossier `esphome/` entier.
+- Les fichiers binaires (ex. `.tft`) ne sont plus affichés ligne à ligne dans « Voir les modifications ».
+- « Envoyer » ajoute les adresses IP locales de HA dans `exports/system.json`.
+
 ## 0.8.0
 - « Envoyer » exporte aussi l'historique des entités listées dans `observation.json` du dépôt (par défaut 10 jours) : `exports/history/observation_5min.csv` (une ligne toutes les 5 min) et `exports/history/observation_evenements.csv` (changements de mode, marche/arrêt…). Lecture seule, uniquement les entités listées ; sert à observer la chaudière et le chauffage.
 
