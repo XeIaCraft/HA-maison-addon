@@ -1,3 +1,6 @@
+## 0.8.0
+- « Envoyer » exporte aussi l'historique des entités listées dans `observation.json` du dépôt (par défaut 10 jours) : `exports/history/observation_5min.csv` (une ligne toutes les 5 min) et `exports/history/observation_evenements.csv` (changements de mode, marche/arrêt…). Lecture seule, uniquement les entités listées ; sert à observer la chaudière et le chauffage.
+
 ## 0.7.0
 - « Appliquer » désactive aussi les entités listées dans `cleanup.json` (`disable_entities` : identifiants exacts ou `re:expression`), par exemple les réglages modifiables inutiles d'ebusd. Réversible (réactive l'entité dans HA). Garde-fou : jamais plus de 400 entités d'un coup. La carte « Nettoyage » propose la même désactivation.
 

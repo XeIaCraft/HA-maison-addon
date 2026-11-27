@@ -318,5 +318,32 @@ n2 = sync.disable_entities(_ws, _ids, _lg2.append); _ws.close()
 ok(n2 == 2 and fh2.updated == [("number.a", "user"), ("sensor.eb_x_timer_1", "user")], "désactivation : appel HA config/entity_registry/update avec disabled_by=user")
 ok(sync.disable_entities(None, ["x"] * 401, _lg2.append) == 0, "désactivation : garde-fou au-delà de 400 entités")
 
+# ── historique d'observation ──
+import time as _time
+_repo3 = _pl.Path(_tf.mkdtemp()); _ex3 = _pl.Path(_tf.mkdtemp())
+(_repo3 / "observation.json").write_text(json.dumps({"days": 1, "step_minutes": 60, "series": {"depart": "sensor.depart"}, "events": ["select.mode"]}))
+_now = 1_800_000_000.0; _end = _now - _now % 3600; _st = _end - 86400
+def _iso2(t): return _time.strftime("%Y-%m-%dT%H:%M:%S+00:00", _time.gmtime(t))
+_calls3 = []
+def _fake_call(url, method="GET", body=None, timeout=60, raw=False):
+    _calls3.append(url)
+    return {"status": 200, "json": [
+        [{"entity_id": "sensor.depart", "state": "50", "last_changed": _iso2(_st - 100)},
+         {"state": "60", "last_changed": _iso2(_st + 1800)}, {"state": "unavailable", "last_changed": _iso2(_st + 7300)}],
+        [{"entity_id": "select.mode", "state": "auto", "last_changed": _iso2(_st + 10)}, {"state": "auto", "last_changed": _iso2(_st + 20)},
+         {"state": "summer", "last_changed": _iso2(_st + 50)}]]}
+_orig3 = sync._call; sync._call = _fake_call
+_lg3 = []
+sync.export_history(_ex3, _lg3.append, repo=_repo3, now=_now)
+sync._call = _orig3
+_rows = (_ex3 / "history" / "observation_60min.csv").read_text().splitlines()
+ok(_rows[0] == "utc,depart" and _rows[1].endswith(",50") and _rows[2].endswith(",60") and _rows[3].endswith(",60") and _rows[4].endswith(",") and len(_rows) == 26,
+   "historique : rééchantillonnage (dernière valeur connue, indisponible = vide)")
+_evs = (_ex3 / "history" / "observation_evenements.csv").read_text().splitlines()
+ok(len(_evs) == 3 and _evs[1].endswith(",select.mode,auto") and _evs[2].endswith(",select.mode,summer"), "historique : changements d'état sans doublons")
+ok("filter_entity_id=select.mode%2Csensor.depart" in _calls3[0] and "no_attributes" in _calls3[0], "historique : seules les entités listées sont demandées")
+_lg4 = []; sync.export_history(_ex3, _lg4.append, repo=_pl.Path(_tf.mkdtemp()), now=_now)
+ok(not (_ex3 / "history").exists(), "historique : sans observation.json, rien n'est exporté (et l'ancien export est retiré)")
+
 print("\nÉCHECS :", fails or "aucun")
 sys.exit(1 if fails else 0)

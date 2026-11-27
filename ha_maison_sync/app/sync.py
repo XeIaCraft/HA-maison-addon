@@ -607,6 +607,109 @@ def export_total(cfg, ex, log):
     return n
 
 
+# ───────────────────────── historique pour l'observation (exports/history/) ─────────────────────────
+# Le dépôt contient `observation.json` :
+#   {"days": 10, "step_minutes": 5, "series": {"depart": "sensor.x", ...}, "events": ["select.y", ...]}
+# → exports/history/observation_5min.csv : une ligne toutes les N minutes (dernière valeur connue de chaque entité, UTC)
+# → exports/history/observation_evenements.csv : chaque changement d'état des entités « events » (modes, marche/arrêt…)
+# Lecture seule (API historique de HA). Uniquement les entités listées par le dépôt.
+HISTORY_MAX_EVENTS = 30000
+
+
+def _iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(t))
+
+
+def _parse_ts(v):
+    import datetime as _dt
+    try:
+        return _dt.datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def fetch_history(entities, start, end):
+    """{entity_id: [(timestamp, état), …]} triés ; API REST de HA (par paquets de 12 entités)."""
+    out = {}
+    for i in range(0, len(entities), 12):
+        chunk = entities[i:i + 12]
+        q = urllib.parse.urlencode({"filter_entity_id": ",".join(chunk), "end_time": _iso(end)})
+        r = _call("http://supervisor/core/api/history/period/%s?%s&minimal_response&no_attributes&significant_changes_only=0"
+                  % (urllib.parse.quote(_iso(start)), q), timeout=120)
+        if r is None or r.get("status") != 200:
+            raise SyncError("historique indisponible (%s)" % (r or {}).get("status"))
+        for serie in r["json"] or []:
+            if not serie:
+                continue
+            eid = serie[0].get("entity_id")
+            pts = []
+            for p in serie:
+                t = _parse_ts(p.get("last_changed") or p.get("last_updated"))
+                if t is not None:
+                    pts.append((t, p.get("state")))
+            out[eid] = sorted(pts)
+    return out
+
+
+def export_history(ex, log, repo=None, now=None):
+    out_dir = ex / "history"
+    shutil.rmtree(out_dir, ignore_errors=True)
+    f = (repo or REPO) / "observation.json"
+    if not f.is_file():
+        return
+    try:
+        obs = json.loads(f.read_text(encoding="utf-8"))
+    except ValueError:
+        log("⚠️ observation.json illisible : historique non exporté.")
+        return
+    series = obs.get("series") or {}
+    events = [e for e in obs.get("events") or [] if isinstance(e, str)]
+    days = max(1, min(int(obs.get("days", 10)), 30))
+    step = max(1, min(int(obs.get("step_minutes", 5)), 60)) * 60
+    now = now or time.time()
+    end = now - now % step
+    start = end - days * 86400
+    hist = fetch_history(sorted(set(series.values()) | set(events)), start, end)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    names = list(series.keys())
+    rows, idx = [], {n: 0 for n in names}
+    cur = {n: "" for n in names}
+    t = start
+    while t <= end:
+        line = [time.strftime("%Y-%m-%d %H:%M", time.gmtime(t))]
+        for n in names:
+            pts = hist.get(series[n], [])
+            while idx[n] < len(pts) and pts[idx[n]][0] <= t:
+                v = pts[idx[n]][1]
+                cur[n] = "" if v in (None, "unknown", "unavailable") else str(v)
+                idx[n] += 1
+            line.append(cur[n])
+        rows.append(line)
+        t += step
+    import csv as _csv
+    with open(out_dir / ("observation_%dmin.csv" % (step // 60)), "w", newline="", encoding="utf-8") as fh:
+        w = _csv.writer(fh)
+        w.writerow(["utc"] + names)
+        w.writerows(rows)
+    ev = []
+    for e in events:
+        prev = object()
+        for (ts, v) in hist.get(e, []):
+            if v != prev:
+                ev.append((ts, e, v))
+                prev = v
+    ev.sort()
+    if len(ev) > HISTORY_MAX_EVENTS:
+        ev = ev[-HISTORY_MAX_EVENTS:]
+    with open(out_dir / "observation_evenements.csv", "w", newline="", encoding="utf-8") as fh:
+        w = _csv.writer(fh)
+        w.writerow(["utc", "entite", "etat"])
+        w.writerows([(time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts)), e, v) for ts, e, v in ev])
+    found = sum(1 for e in set(series.values()) | set(events) if hist.get(e))
+    log(f"📈 Historique d'observation : {days} j, {len(rows)} lignes × {len(names)} valeurs, {len(ev)} changements "
+        f"({found} entité(s) avec des données).")
+
+
 def export(force=False):
     log = Run()
     o = ensure_repo(log)
@@ -686,6 +789,10 @@ def export(force=False):
         log("⚠️ Inventaire des entités non mis à jour (API Core indisponible).")
     if o.get("export_full", True) or full_access:
         export_full(cfg, ex, log, skipped)
+    try:
+        export_history(ex, log)
+    except Exception as e:  # ne doit jamais empêcher l'envoi
+        log(f"⚠️ Historique d'observation non exporté : {e}")
     if full_access:
         export_total(cfg, ex, log)
     else:
